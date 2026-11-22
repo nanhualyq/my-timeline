@@ -317,6 +317,7 @@ const items = computed<SidebarItem[]>(() => {
   gap: 0.5rem;
   padding: 0.75rem;
   border-right: 1px solid #ddd;
+  min-height: 0;
   overflow-y: auto;
 }
 .add-form {

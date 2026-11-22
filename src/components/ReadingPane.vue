@@ -53,6 +53,7 @@ const emit = defineEmits<{
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   overflow: hidden;
 }
 .pane-header {
@@ -62,6 +63,7 @@ const emit = defineEmits<{
   gap: 1rem;
   padding: 0.75rem 1rem;
   border-bottom: 1px solid #ddd;
+  flex-shrink: 0;
 }
 .pane-title {
   margin: 0 0 0.25rem;
@@ -94,6 +96,8 @@ const emit = defineEmits<{
   padding: 1rem 1.25rem;
   overflow-y: auto;
   line-height: 1.6;
+  flex: 1;
+  min-height: 0;
 }
 .content :deep(img) {
   max-width: 100%;

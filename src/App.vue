@@ -259,11 +259,29 @@ onMounted(reload);
   </main>
 </template>
 
+<style>
+/* Unscoped: the app owns the whole viewport, so the document itself must
+   never scroll — only the individual columns do. */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+#app {
+  height: 100%;
+}
+</style>
+
 <style scoped>
 .layout {
   display: grid;
   grid-template-columns: minmax(200px, 260px) minmax(260px, 360px) 1fr;
+  /* minmax(0, 1fr): an `auto` implicit row would grow past 100vh with a
+     long entry list, scrolling the whole document instead of the column. */
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
+  overflow: hidden;
   position: relative;
 }
 .global-error {

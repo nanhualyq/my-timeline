@@ -79,6 +79,10 @@ function fmtDate(iso: string | null): string {
   flex-direction: column;
   border-right: 1px solid #ddd;
   min-width: 0;
+  /* Grid items default to min-height: auto, which keeps this column as tall
+     as its content; opt out so the list below can scroll on its own. */
+  min-height: 0;
+  overflow: hidden;
 }
 .list-header {
   display: flex;
@@ -120,6 +124,7 @@ function fmtDate(iso: string | null): string {
   padding: 0;
   overflow-y: auto;
   flex: 1;
+  min-height: 0;
 }
 .entry {
   display: flex;
