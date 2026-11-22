@@ -160,6 +160,14 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .map_err(|e| format!("app data dir: {e}"))?;
+            // Debug builds must not share the production database: the data dir
+            // is derived from the bundle identifier, which `tauri dev` does not
+            // override, so dev and release would otherwise open the same file.
+            let data_dir = if cfg!(debug_assertions) {
+                data_dir.with_file_name("com.mytimeline.app-dev")
+            } else {
+                data_dir
+            };
             let conn = db::open(&data_dir.join("reader.db")).map_err(|e| e.to_string())?;
             app.manage(Arc::new(Mutex::new(conn)) as SharedConn);
             Ok(())
