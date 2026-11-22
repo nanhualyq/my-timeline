@@ -158,7 +158,7 @@ const items = computed<SidebarItem[]>(() => {
         @click="emit('select', { kind: 'starred' })"
       >
         <span class="feed-title">&#9733; Starred</span>
-        <span v-if="starredCount > 0" class="unread-badge">
+        <span v-if="starredCount > 0" class="unread-badge starred">
           {{ starredCount }}
         </span>
       </button>
@@ -364,13 +364,26 @@ const items = computed<SidebarItem[]>(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Counts are secondary information: keep them quiet (gray text, no solid
+ * pill) so the list stays the focus. Only the starred count is highlighted. */
 .unread-badge {
+  background: transparent;
+  color: #a3a3a3;
+  font-size: 0.7rem;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.feed-item:hover .unread-badge:not(.starred),
+.feed-item.active .unread-badge:not(.starred) {
+  color: #8f8f8f;
+}
+.unread-badge.starred {
   background: #2d7ff9;
   color: #fff;
   font-size: 0.72rem;
-  border-radius: 10px;
+  font-weight: 600;
   padding: 0 0.45rem;
-  flex-shrink: 0;
+  border-radius: 10px;
 }
 .error-dot {
   width: 8px;
