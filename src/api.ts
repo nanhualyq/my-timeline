@@ -37,6 +37,13 @@ export interface RefreshOutcome {
 
 export type EntryView = "all" | "unread";
 
+/** Aggregate counts for the two global sidebar rows. Both count read and
+ * unread entries alike. */
+export interface EntryCounts {
+  all_entries: number;
+  starred_entries: number;
+}
+
 /** Which entries to list. The starred view is global: it never combines
  * with a feed or folder selection. */
 export type EntryScope =
@@ -66,6 +73,10 @@ export function listEntries(view: EntryView, scope: EntryScope): Promise<Entry[]
 
 export function setRead(entryId: number, isRead: boolean): Promise<void> {
   return invoke("set_read", { entryId, isRead });
+}
+
+export function entryCounts(): Promise<EntryCounts> {
+  return invoke<EntryCounts>("entry_counts");
 }
 
 export function setStarred(entryId: number, isStarred: boolean): Promise<void> {

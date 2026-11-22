@@ -6,6 +6,8 @@ defineProps<{
   selectedEntryId: number | null;
   view: "all" | "unread";
   busy: boolean;
+  /** False while the Starred view is selected: that view has no unread filter. */
+  unreadFilterAvailable: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -33,6 +35,7 @@ function fmtDate(iso: string | null): string {
           All
         </button>
         <button
+          v-if="unreadFilterAvailable"
           :class="{ active: view === 'unread' }"
           @click="emit('setView', 'unread')"
         >

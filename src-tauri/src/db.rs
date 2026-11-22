@@ -289,6 +289,29 @@ pub fn set_starred(
     Ok(())
 }
 
+/// Aggregate counts for the two global sidebar rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryCountsDto {
+    /// Total stored entries, read and unread alike.
+    pub all_entries: i64,
+    /// Total starred entries, read and unread alike.
+    pub starred_entries: i64,
+}
+
+/// Total and starred entry counts in one statement, for the global sidebar badges.
+pub fn entry_counts(conn: &Connection) -> Result<EntryCountsDto, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(is_starred), 0) FROM entries",
+        [],
+        |r| {
+            Ok(EntryCountsDto {
+                all_entries: r.get(0)?,
+                starred_entries: r.get(1)?,
+            })
+        },
+    )
+}
+
 /// Delete a feed; entries cascade (verified by schema test).
 pub fn delete_feed(conn: &Connection, feed_id: i64) -> Result<(), String> {
     conn.execute("DELETE FROM feeds WHERE id = ?1", params![feed_id])
@@ -910,6 +933,36 @@ mod tests {
         assert!(entry.is_read, "read state untouched by unstarring");
 
         assert!(set_starred(&conn, 999, true).is_err(), "unknown entry rejected");
+    }
+
+    #[test]
+    fn entry_counts_cover_totals_and_stars() {
+        let conn = open_memory().unwrap();
+        let empty = entry_counts(&conn).unwrap();
+        assert_eq!((empty.all_entries, empty.starred_entries), (0, 0), "zero-entry case");
+
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        upsert_entry(&conn, f, "g1", "T", None, "<p>x</p>", None).unwrap();
+        upsert_entry(&conn, f, "g2", "T", None, "<p>x</p>", None).unwrap();
+        upsert_entry(&conn, f, "g3", "T", None, "<p>x</p>", None).unwrap();
+
+        let counts = entry_counts(&conn).unwrap();
+        assert_eq!((counts.all_entries, counts.starred_entries), (3, 0));
+
+        // Starred counts include read and unread entries alike.
+        set_starred(&conn, 1, true).unwrap();
+        set_starred(&conn, 3, true).unwrap();
+        let counts = entry_counts(&conn).unwrap();
+        assert_eq!((counts.all_entries, counts.starred_entries), (3, 2));
+
+        // Read state changes neither count.
+        set_read(&conn, 1, true).unwrap();
+        let counts = entry_counts(&conn).unwrap();
+        assert_eq!((counts.all_entries, counts.starred_entries), (3, 2));
+
+        set_starred(&conn, 1, false).unwrap();
+        let counts = entry_counts(&conn).unwrap();
+        assert_eq!((counts.all_entries, counts.starred_entries), (3, 1));
     }
 
     #[test]

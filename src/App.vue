@@ -14,7 +14,9 @@ import {
   removeFeed,
   setRead,
   setStarred,
+  entryCounts,
   type Entry,
+  type EntryCounts,
   type EntryScope,
   type EntryView,
   type Feed,
@@ -29,6 +31,7 @@ const entries = ref<Entry[]>([]);
 const selection = ref<Selection>({ kind: "all" });
 const selectedEntryId = ref<number | null>(null);
 const view = ref<EntryView>("all");
+const counts = ref<EntryCounts>({ all_entries: 0, starred_entries: 0 });
 const busy = ref(false);
 const loadError = ref<string | null>(null);
 const editingFeed = ref<Feed | null>(null);
@@ -42,6 +45,11 @@ const selectedFeed = computed(() => {
   if (!entry) return null;
   return feeds.value.find((f) => f.id === entry.feed_id) ?? null;
 });
+
+/** Tab shown in the entry list: the starred view is always on "All". */
+const displayView = computed<EntryView>(() =>
+  selection.value.kind === "starred" ? "all" : view.value,
+);
 
 function scopeOf(sel: Selection): EntryScope {
   switch (sel.kind) {
@@ -61,8 +69,14 @@ function isGlobal(sel: Selection): boolean {
 }
 
 async function refreshCounts() {
-  feeds.value = await listFeeds();
-  folders.value = await listFolders();
+  const [feedList, folderList, global] = await Promise.all([
+    listFeeds(),
+    listFolders(),
+    entryCounts(),
+  ]);
+  feeds.value = feedList;
+  folders.value = folderList;
+  counts.value = global;
 }
 
 async function reload() {
@@ -73,9 +87,15 @@ async function reload() {
     if (sel.kind === "folder" && !folders.value.some((f) => f.id === sel.id)) {
       selection.value = { kind: "all" };
     }
-    // The all/unread tabs apply to the global views; feed and folder
-    // selections always show that scope's full list (pre-existing behavior).
-    const activeView: EntryView = isGlobal(selection.value) ? view.value : "all";
+    // The starred view always lists every starred entry; the all/unread
+    // tabs apply to "All entries" only. Feed and folder selections always
+    // show that scope's full list (pre-existing behavior).
+    const activeView: EntryView =
+      selection.value.kind === "starred"
+        ? "all"
+        : isGlobal(selection.value)
+          ? view.value
+          : "all";
     entries.value = await listEntries(activeView, scopeOf(selection.value));
     loadError.value = null;
     // Keep the open entry if it still exists; otherwise clear the pane.
@@ -97,6 +117,9 @@ function select(sel: Selection) {
 }
 
 function setView(v: EntryView) {
+  // The starred view has no unread filter, so tab clicks there are ignored
+  // (the tab is hidden anyway); this also keeps "All entries"' tab intact.
+  if (selection.value.kind === "starred") return;
   view.value = v;
   // Tabs only apply to the global views; a feed/folder selection falls back
   // to "All entries" (the starred view keeps its scope).
@@ -135,8 +158,9 @@ async function toggleStar(entry: Entry) {
     await setStarred(entry.id, next);
     entry.is_starred = next;
     // Leaving the starred view must drop the entry from its list.
+    // The starred scope always lists every starred entry (no unread filter).
     if (selection.value.kind === "starred") {
-      entries.value = await listEntries(view.value, { kind: "starred" });
+      entries.value = await listEntries("all", { kind: "starred" });
       if (
         selectedEntryId.value !== null &&
         !entries.value.some((e) => e.id === selectedEntryId.value)
@@ -144,6 +168,8 @@ async function toggleStar(entry: Entry) {
         selectedEntryId.value = null;
       }
     }
+    // Starring changes the Starred badge, so counts refresh here too.
+    await refreshCounts();
   } catch (e) {
     loadError.value = String(e);
   }
@@ -226,6 +252,8 @@ onMounted(reload);
       :folders="folders"
       :selection="selection"
       :busy="busy"
+      :all-count="counts.all_entries"
+      :starred-count="counts.starred_entries"
       @select="select"
       @changed="reload"
       @remove="doRemove"
@@ -236,7 +264,8 @@ onMounted(reload);
     <EntryList
       :entries="entries"
       :selected-entry-id="selectedEntryId"
-      :view="view"
+      :view="displayView"
+      :unread-filter-available="selection.kind !== 'starred'"
       :busy="busy"
       @select="selectEntry"
       @toggle-star="toggleStar"

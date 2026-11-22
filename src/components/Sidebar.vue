@@ -19,6 +19,10 @@ const props = defineProps<{
   folders: Folder[];
   selection: Selection;
   busy: boolean;
+  /** Total stored entries, for the "All entries" badge. */
+  allCount: number;
+  /** Total starred entries, for the "Starred" badge. */
+  starredCount: number;
 }>();
 
 const emit = defineEmits<{
@@ -218,6 +222,7 @@ const items = computed<SidebarItem[]>(() => {
         @click="emit('select', { kind: 'all' })"
       >
         <span class="feed-title">All entries</span>
+        <span v-if="allCount > 0" class="unread-badge">{{ allCount }}</span>
       </button>
       <button
         class="feed-item global"
@@ -225,6 +230,9 @@ const items = computed<SidebarItem[]>(() => {
         @click="emit('select', { kind: 'starred' })"
       >
         <span class="feed-title">&#9733; Starred</span>
+        <span v-if="starredCount > 0" class="unread-badge">
+          {{ starredCount }}
+        </span>
       </button>
 
       <div class="group-header">

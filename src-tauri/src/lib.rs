@@ -36,6 +36,14 @@ fn list_folders(app: tauri::AppHandle) -> Result<Vec<db::FolderDto>, String> {
     db::list_folders(&guard)
 }
 
+/// Total and starred entry counts for the two global sidebar badges.
+#[tauri::command]
+fn entry_counts(app: tauri::AppHandle) -> Result<db::EntryCountsDto, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::entry_counts(&guard).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn create_folder(app: tauri::AppHandle, name: String) -> Result<db::FolderDto, String> {
     let conn = shared_conn(&app)?;
@@ -200,6 +208,7 @@ pub fn run() {
             list_feeds,
             list_entries,
             list_folders,
+            entry_counts,
             create_folder,
             rename_folder,
             delete_folder,
