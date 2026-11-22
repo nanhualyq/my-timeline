@@ -32,8 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_entries_read ON entries(is_read, published_at DES
 pub const FOLDERS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS folders (
     id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    position INTEGER NOT NULL
+    name TEXT NOT NULL
 );
 ";
 
@@ -101,7 +100,6 @@ pub struct FeedDto {
 pub struct FolderDto {
     pub id: i64,
     pub name: String,
-    pub position: i64,
     pub unread_count: i64,
     pub feeds: Vec<FeedDto>,
 }
@@ -348,22 +346,18 @@ pub fn all_feed_ids_and_urls(conn: &Connection) -> Result<Vec<(i64, String)>, ru
     rows.collect()
 }
 
-/// Create a folder. The name MUST be non-empty; position is appended last.
+/// Create a folder. The name MUST be non-empty.
 pub fn create_folder(conn: &Connection, name: &str) -> Result<FolderDto, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("folder name is empty".into());
     }
-    conn.execute(
-        "INSERT INTO folders (name, position)
-         VALUES (?1, (SELECT COALESCE(MAX(position), -1) + 1 FROM folders))",
-        params![name],
-    )
-    .map_err(|e| e.to_string())?;
+    conn.execute("INSERT INTO folders (name) VALUES (?1)", params![name])
+        .map_err(|e| e.to_string())?;
     let id = conn
         .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    Ok(FolderDto { id, name: name.into(), position: 0, unread_count: 0, feeds: vec![] })
+    Ok(FolderDto { id, name: name.into(), unread_count: 0, feeds: vec![] })
 }
 
 /// Rename a folder. The new name MUST be non-empty.
@@ -402,24 +396,6 @@ pub fn delete_folder(conn: &Connection, folder_id: i64) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())
 }
 
-/// Set the folder display order. `ordered_ids` MUST list every folder id
-/// exactly once; positions become the slice indices.
-pub fn reorder_folders(conn: &Connection, ordered_ids: &[i64]) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    for (position, id) in ordered_ids.iter().enumerate() {
-        let n = tx
-            .execute(
-                "UPDATE folders SET position = ?1 WHERE id = ?2",
-                params![position as i64, id],
-            )
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err(format!("folder {id} not found"));
-        }
-    }
-    tx.commit().map_err(|e| e.to_string())
-}
-
 /// Move a feed to a folder, or to uncategorized when `folder_id` is None.
 pub fn move_feed_to_folder(
     conn: &Connection,
@@ -451,18 +427,19 @@ pub fn move_feed_to_folder(
     Ok(())
 }
 
-/// Folders ordered by position, each with its feeds (title order) nested and
-/// an unread count aggregated over those feeds in SQL. Uncategorized feeds are
-/// not included here; they are the feeds with `folder_id == None`.
+/// Folders ordered by name using default string comparison (case-sensitive,
+/// with `id` as a deterministic tie-break), each with its feeds (title order)
+/// nested and an unread count aggregated over those feeds in SQL. Uncategorized
+/// feeds are not included here; they are the feeds with `folder_id == None`.
 pub fn list_folders(conn: &Connection) -> Result<Vec<FolderDto>, String> {
     let mut folders: Vec<FolderDto> = {
         let mut stmt = conn
             .prepare(
-                "SELECT f.id, f.name, f.position,
+                "SELECT f.id, f.name,
                         (SELECT COUNT(*) FROM entries e
                           JOIN feeds fd ON e.feed_id = fd.id
                           WHERE fd.folder_id = f.id AND e.is_read = 0)
-                 FROM folders f ORDER BY f.position, f.id",
+                 FROM folders f ORDER BY f.name, f.id",
             )
             .map_err(|e| e.to_string())?;
         stmt
@@ -470,8 +447,7 @@ pub fn list_folders(conn: &Connection) -> Result<Vec<FolderDto>, String> {
                 Ok(FolderDto {
                     id: r.get(0)?,
                     name: r.get(1)?,
-                    position: r.get(2)?,
-                    unread_count: r.get(3)?,
+                    unread_count: r.get(2)?,
                     feeds: vec![],
                 })
             })
@@ -540,6 +516,20 @@ mod tests {
             .unwrap();
         assert_eq!(folders, 1);
 
+        let folder_cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(folders)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(
+            !folder_cols.contains(&"position".to_string()),
+            "position column is gone; folders are ordered by name"
+        );
+
         let feed_cols: Vec<String> = {
             let mut stmt = conn.prepare("PRAGMA table_info(feeds)").unwrap();
             let rows = stmt
@@ -591,12 +581,10 @@ mod tests {
         let blogs = create_folder(&conn, " Blogs ").unwrap();
         assert_eq!(blogs.name, "Blogs", "name is trimmed");
 
-        // Position: appended in creation order.
+        // Name order (default string comparison), independent of creation order.
         let folders = list_folders(&conn).unwrap();
         let ids: Vec<i64> = folders.iter().map(|f| f.id).collect();
-        assert_eq!(ids, vec![tech.id, blogs.id]);
-        assert_eq!(folders[0].position, 0);
-        assert_eq!(folders[1].position, 1);
+        assert_eq!(ids, vec![blogs.id, tech.id], "\"Blogs\" sorts before \"Tech\"");
 
         assert!(create_folder(&conn, "   ").is_err(), "empty name rejected");
         assert!(rename_folder(&conn, tech.id, "").is_err(), "empty rename rejected");
@@ -611,12 +599,6 @@ mod tests {
         assert!(move_feed_to_folder(&conn, feed, Some(999)).is_err(), "unknown folder rejected");
         assert!(move_feed_to_folder(&conn, 999, None).is_err(), "unknown feed rejected");
 
-        reorder_folders(&conn, &[blogs.id, tech.id]).unwrap();
-        let folders = list_folders(&conn).unwrap();
-        assert_eq!(folders[0].id, blogs.id);
-        assert_eq!(folders[1].id, tech.id);
-        assert!(reorder_folders(&conn, &[999]).is_err(), "unknown id rejected");
-
         // Deleting the folder reassigns its feed to uncategorized.
         delete_folder(&conn, tech.id).unwrap();
         let a = get_feed(&conn, feed).unwrap().unwrap();
@@ -630,6 +612,28 @@ mod tests {
             .unwrap();
         assert_eq!(feed_rows, 1, "feed survives folder deletion");
         assert!(delete_folder(&conn, tech.id).is_err(), "double delete rejected");
+    }
+
+    #[test]
+    fn list_folders_orders_by_name_with_default_comparison() {
+        let conn = open_memory().unwrap();
+        let names = |c: &Connection| -> Vec<String> {
+            list_folders(c).unwrap().into_iter().map(|f| f.name).collect()
+        };
+
+        // Creation order does not matter: name order wins.
+        let tech = create_folder(&conn, "Tech").unwrap();
+        create_folder(&conn, "Books").unwrap();
+        assert_eq!(names(&conn), vec!["Books", "Tech"]);
+
+        // Default string comparison is case-sensitive: 'B' (66) sorts before 'a' (97).
+        create_folder(&conn, "apple").unwrap();
+        create_folder(&conn, "Banana").unwrap();
+        assert_eq!(names(&conn), vec!["Banana", "Books", "Tech", "apple"]);
+
+        // Renaming moves the folder to the position implied by its new name.
+        rename_folder(&conn, tech.id, "Arts").unwrap();
+        assert_eq!(names(&conn), vec!["Arts", "Banana", "Books", "apple"]);
     }
 
     #[test]

@@ -8,7 +8,6 @@ import {
   importOpml,
   moveFeedToFolder,
   renameFolder,
-  reorderFolders,
   type Feed,
   type Folder,
   type Selection,
@@ -87,14 +86,6 @@ function confirmDeleteFolder(folder: Folder) {
   }
 }
 
-async function moveFolder(index: number, dir: -1 | 1) {
-  const ids = props.folders.map((f) => f.id);
-  const target = index + dir;
-  if (target < 0 || target >= ids.length) return;
-  [ids[index], ids[target]] = [ids[target], ids[index]];
-  await runAction(() => reorderFolders(ids));
-}
-
 function onMoveFeed(feed: Feed, event: Event) {
   const select = event.target as HTMLSelectElement;
   const value = select.value;
@@ -144,15 +135,15 @@ const uncategorized = computed(() =>
 
 type SidebarItem =
   | { key: string; type: "label"; label: string }
-  | { key: string; type: "folder"; folder: Folder; index: number }
+  | { key: string; type: "folder"; folder: Folder }
   | { key: string; type: "feed"; feed: Feed; nested: boolean };
 
 /** Linearized sidebar rows: global views, folder headers with their feeds
  * nested underneath, then the uncategorized group. */
 const items = computed<SidebarItem[]>(() => {
   const out: SidebarItem[] = [];
-  props.folders.forEach((folder, index) => {
-    out.push({ key: `folder-${folder.id}`, type: "folder", folder, index });
+  props.folders.forEach((folder) => {
+    out.push({ key: `folder-${folder.id}`, type: "folder", folder });
     for (const feed of folder.feeds) {
       out.push({ key: `feed-${feed.id}`, type: "feed", feed, nested: true });
     }
@@ -258,22 +249,6 @@ const items = computed<SidebarItem[]>(() => {
             </span>
           </button>
           <span class="feed-actions">
-            <button
-              class="icon-btn"
-              title="Move folder up"
-              :disabled="busy || item.index === 0"
-              @click="moveFolder(item.index, -1)"
-            >
-              &#x2191;
-            </button>
-            <button
-              class="icon-btn"
-              title="Move folder down"
-              :disabled="busy || item.index === folders.length - 1"
-              @click="moveFolder(item.index, 1)"
-            >
-              &#x2193;
-            </button>
             <button
               class="icon-btn"
               title="Rename folder"

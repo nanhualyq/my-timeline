@@ -15,7 +15,6 @@ export interface Feed {
 export interface Folder {
   id: number;
   name: string;
-  position: number;
   unread_count: number;
   feeds: Feed[];
 }
@@ -109,10 +108,6 @@ export function renameFolder(folderId: number, name: string): Promise<void> {
 
 export function deleteFolder(folderId: number): Promise<void> {
   return invoke("delete_folder", { folderId });
-}
-
-export function reorderFolders(orderedIds: number[]): Promise<void> {
-  return invoke("reorder_folders", { orderedIds });
 }
 
 export function moveFeedToFolder(

@@ -58,13 +58,6 @@ fn delete_folder(app: tauri::AppHandle, folder_id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn reorder_folders(app: tauri::AppHandle, ordered_ids: Vec<i64>) -> Result<(), String> {
-    let conn = shared_conn(&app)?;
-    let guard = conn.lock().map_err(|e| e.to_string())?;
-    db::reorder_folders(&guard, &ordered_ids)
-}
-
-#[tauri::command]
 fn move_feed_to_folder(
     app: tauri::AppHandle,
     feed_id: i64,
@@ -179,7 +172,6 @@ pub fn run() {
             create_folder,
             rename_folder,
             delete_folder,
-            reorder_folders,
             move_feed_to_folder,
             set_read,
             set_starred,

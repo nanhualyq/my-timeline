@@ -53,14 +53,29 @@ The system SHALL let the user create a folder with a name and rename an existing
 - **WHEN** the user renames "Tech" to "Technology"
 - **THEN** all feeds previously under "Tech" remain under the renamed folder
 
-### Requirement: User can reorder folders
+### Requirement: Folders are ordered by name
 
-The system SHALL let the user change the display order of folders, and the chosen order SHALL persist across restarts.
+The system SHALL display folders ordered by their names using default string comparison (case-sensitive, code-unit order), and SHALL NOT provide any way for the user to change folder order.
 
-#### Scenario: Reordering folders
+#### Scenario: Folders appear in name order regardless of creation order
 
-- **WHEN** the user moves folder "B" above folder "A"
-- **THEN** the sidebar lists "B" before "A" and the order is the same after a restart
+- **WHEN** the user creates a folder named "Tech" and then a folder named "Books"
+- **THEN** the sidebar lists "Books" before "Tech"
+
+#### Scenario: Default string comparison is case-sensitive
+
+- **WHEN** folders named "apple" and "Banana" exist
+- **THEN** the sidebar lists "Banana" before "apple", because uppercase letters sort before lowercase ones under default string comparison
+
+#### Scenario: Renaming changes a folder's position in the list
+
+- **WHEN** the user renames a folder so its name sorts earlier than before
+- **THEN** the sidebar updates and the folder appears at the position implied by its new name
+
+#### Scenario: No reorder controls are shown
+
+- **WHEN** the sidebar displays a folder row
+- **THEN** the row offers no control for moving the folder up or down
 
 ### Requirement: Deleting a folder reassigns its feeds
 
