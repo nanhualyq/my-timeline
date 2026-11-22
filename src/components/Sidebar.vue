@@ -1,18 +1,13 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import {
-  addFeed,
-  createFolder,
   deleteFolder,
-  exportOpml,
-  importOpml,
   renameFolder,
   type Feed,
   type Folder,
   type Selection,
 } from "../api";
 import RowMenu from "./RowMenu.vue";
-import { open, save } from "@tauri-apps/plugin-dialog";
 
 const props = defineProps<{
   feeds: Feed[];
@@ -32,28 +27,10 @@ const emit = defineEmits<{
   refreshOne: [feedId: number];
   refreshFolder: [folderId: number];
   edit: [feed: Feed];
+  openSettings: [];
 }>();
 
-const newUrl = ref("");
-const addError = ref<string | null>(null);
 const actionError = ref<string | null>(null);
-const addBusy = ref(false);
-
-async function submitAdd() {
-  const url = newUrl.value.trim();
-  if (!url || addBusy.value) return;
-  addBusy.value = true;
-  addError.value = null;
-  try {
-    await addFeed(url);
-    newUrl.value = "";
-    emit("changed");
-  } catch (e) {
-    addError.value = String(e);
-  } finally {
-    addBusy.value = false;
-  }
-}
 
 function confirmRemove(feed: Feed) {
   if (confirm(`Remove subscription "${feed.title}"?`)) {
@@ -70,12 +47,6 @@ async function runAction(fn: () => Promise<unknown>) {
   } catch (e) {
     actionError.value = String(e);
   }
-}
-
-function createFolderAction() {
-  const name = prompt("Folder name");
-  if (name === null) return;
-  void runAction(() => createFolder(name));
 }
 
 function renameFolderAction(folder: Folder) {
@@ -102,41 +73,6 @@ function onFeedMenu(key: string, feed: Feed) {
   if (key === "edit") emit("edit", feed);
   else if (key === "refresh") emit("refreshOne", feed.id);
   else if (key === "remove") confirmRemove(feed);
-}
-
-async function doImport() {
-  try {
-    const path = await open({
-      multiple: false,
-      filters: [{ name: "OPML", extensions: ["opml", "xml"] }],
-    });
-    if (typeof path !== "string") return;
-    actionError.value = null;
-    const outcome = await importOpml(path);
-    alert(
-      `Import complete: ${outcome.feeds_added} added, ` +
-        `${outcome.feeds_skipped} skipped, ` +
-        `${outcome.folders_created} folder(s) created`,
-    );
-    emit("changed");
-  } catch (e) {
-    actionError.value = String(e);
-  }
-}
-
-async function doExport() {
-  try {
-    const path = await save({
-      defaultPath: "subscriptions.opml",
-      filters: [{ name: "OPML", extensions: ["opml"] }],
-    });
-    if (!path) return;
-    actionError.value = null;
-    const outcome = await exportOpml(path);
-    alert(`Exported ${outcome.feeds_exported} feeds`);
-  } catch (e) {
-    actionError.value = String(e);
-  }
 }
 
 const uncategorized = computed(() =>
@@ -182,38 +118,16 @@ const items = computed<SidebarItem[]>(() => {
 
 <template>
   <aside class="sidebar">
-    <form class="add-form" @submit.prevent="submitAdd">
-      <input
-        v-model="newUrl"
-        type="url"
-        placeholder="Feed URL…"
-        :disabled="busy || addBusy"
-      />
-      <button type="submit" :disabled="addBusy || !newUrl.trim()">Add</button>
-    </form>
-    <p v-if="addError" class="error">{{ addError }}</p>
+    <button
+      type="button"
+      class="settings-btn"
+      title="Settings"
+      @click="emit('openSettings')"
+    >
+      <span aria-hidden="true">&#9881;</span>
+      <span>Settings</span>
+    </button>
     <p v-if="actionError" class="error">{{ actionError }}</p>
-
-    <div class="opml-actions">
-      <button
-        type="button"
-        class="opml-btn"
-        :disabled="busy || addBusy"
-        title="Import subscriptions from an OPML file"
-        @click="doImport"
-      >
-        Import OPML
-      </button>
-      <button
-        type="button"
-        class="opml-btn"
-        :disabled="busy || addBusy"
-        title="Export all subscriptions to an OPML file"
-        @click="doExport"
-      >
-        Export OPML
-      </button>
-    </div>
 
     <nav class="feed-list">
       <button
@@ -235,17 +149,7 @@ const items = computed<SidebarItem[]>(() => {
         </span>
       </button>
 
-      <div class="group-header">
-        <span>Folders</span>
-        <button
-          class="icon-btn"
-          title="New folder"
-          :disabled="busy"
-          @click="createFolderAction"
-        >
-          +
-        </button>
-      </div>
+      <div class="group-header">Folders</div>
 
       <template v-for="item in items" :key="item.key">
         <div v-if="item.type === 'label'" class="group-header">
@@ -328,48 +232,26 @@ const items = computed<SidebarItem[]>(() => {
   min-height: 0;
   overflow-y: auto;
 }
-.add-form {
+.settings-btn {
   display: flex;
+  align-items: center;
   gap: 0.4rem;
-}
-.add-form input {
-  flex: 1;
-  min-width: 0;
+  width: 100%;
   padding: 0.4rem 0.5rem;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-}
-.add-form button {
-  padding: 0.4rem 0.7rem;
   border: 1px solid #ccc;
   border-radius: 4px;
   background: #f5f5f5;
   cursor: pointer;
+  font-size: 0.85rem;
+  text-align: left;
+}
+.settings-btn:hover {
+  background: #eaeaea;
 }
 .error {
   color: #c0392b;
   font-size: 0.8rem;
   margin: 0;
-}
-.opml-actions {
-  display: flex;
-  gap: 0.4rem;
-}
-.opml-btn {
-  flex: 1;
-  padding: 0.3rem 0.4rem;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  background: #f5f5f5;
-  cursor: pointer;
-  font-size: 0.75rem;
-}
-.opml-btn:hover:not(:disabled) {
-  background: #eaeaea;
-}
-.opml-btn:disabled {
-  opacity: 0.6;
-  cursor: default;
 }
 .feed-list {
   display: flex;
@@ -436,23 +318,6 @@ const items = computed<SidebarItem[]>(() => {
   border-radius: 10px;
   padding: 0 0.45rem;
   flex-shrink: 0;
-}
-.icon-btn {
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font-size: 0.9rem;
-  padding: 0.15rem 0.3rem;
-  border-radius: 4px;
-  color: #666;
-}
-.icon-btn:hover:not(:disabled) {
-  background: #ddd;
-  color: #000;
-}
-.icon-btn:disabled {
-  opacity: 0.35;
-  cursor: default;
 }
 .error-dot {
   width: 8px;

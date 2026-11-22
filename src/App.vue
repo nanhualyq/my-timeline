@@ -4,6 +4,7 @@ import Sidebar from "./components/Sidebar.vue";
 import EntryList from "./components/EntryList.vue";
 import ReadingPane from "./components/ReadingPane.vue";
 import FeedEditDialog from "./components/FeedEditDialog.vue";
+import SettingsDialog from "./components/SettingsDialog.vue";
 import {
   listFeeds,
   listFolders,
@@ -35,6 +36,18 @@ const counts = ref<EntryCounts>({ all_entries: 0, starred_entries: 0 });
 const busy = ref(false);
 const loadError = ref<string | null>(null);
 const editingFeed = ref<Feed | null>(null);
+const settingsOpen = ref(false);
+
+// The two modals are mutually exclusive — never stack them.
+function openSettings() {
+  editingFeed.value = null;
+  settingsOpen.value = true;
+}
+
+function startEdit(feed: Feed) {
+  settingsOpen.value = false;
+  editingFeed.value = feed;
+}
 
 const selectedEntry = computed(
   () => entries.value.find((e) => e.id === selectedEntryId.value) ?? null,
@@ -259,7 +272,8 @@ onMounted(reload);
       @remove="doRemove"
       @refresh-one="doRefreshOne"
       @refresh-folder="doRefreshFolder"
-      @edit="editingFeed = $event"
+      @edit="startEdit"
+      @open-settings="openSettings"
     />
     <EntryList
       :entries="entries"
@@ -284,6 +298,12 @@ onMounted(reload);
       :folders="folders"
       @close="editingFeed = null"
       @saved="onFeedSaved"
+    />
+    <SettingsDialog
+      v-if="settingsOpen"
+      :busy="busy"
+      @close="settingsOpen = false"
+      @changed="reload"
     />
   </main>
 </template>
