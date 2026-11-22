@@ -32,6 +32,17 @@ const emit = defineEmits<{
 
 const actionError = ref<string | null>(null);
 
+/** Folder ids the user has expanded this session. Empty = all collapsed,
+ * which is the default at every launch; state is never persisted. */
+const expandedFolders = ref(new Set<number>());
+
+function toggleFolder(folderId: number) {
+  const next = new Set(expandedFolders.value);
+  if (next.has(folderId)) next.delete(folderId);
+  else next.add(folderId);
+  expandedFolders.value = next;
+}
+
 function confirmRemove(feed: Feed) {
   if (confirm(`Remove subscription "${feed.title}"?`)) {
     emit("remove", feed.id);
@@ -102,6 +113,9 @@ const items = computed<SidebarItem[]>(() => {
   const out: SidebarItem[] = [];
   props.folders.forEach((folder) => {
     out.push({ key: `folder-${folder.id}`, type: "folder", folder });
+    // Collapsed folders contribute no feed rows: their feeds are not
+    // rendered at all (no hidden-but-focusable DOM).
+    if (!expandedFolders.value.has(folder.id)) return;
     for (const feed of folder.feeds) {
       out.push({ key: `feed-${feed.id}`, type: "feed", feed, nested: true });
     }
@@ -164,6 +178,19 @@ const items = computed<SidebarItem[]>(() => {
               selection.kind === 'folder' && selection.id === item.folder.id,
           }"
         >
+          <button
+            type="button"
+            class="folder-toggle"
+            :aria-expanded="expandedFolders.has(item.folder.id)"
+            :aria-label="
+              expandedFolders.has(item.folder.id)
+                ? 'Collapse folder'
+                : 'Expand folder'
+            "
+            @click.stop="toggleFolder(item.folder.id)"
+          >
+            <span class="caret" aria-hidden="true">&#9656;</span>
+          </button>
           <button
             class="feed-item"
             @click="emit('select', { kind: 'folder', id: item.folder.id })"
@@ -285,6 +312,32 @@ const items = computed<SidebarItem[]>(() => {
 }
 .feed-row.nested .feed-item {
   padding-left: 1.1rem;
+}
+.folder-toggle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.35rem;
+  align-self: stretch;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: #666;
+  border-radius: 4px;
+  padding: 0;
+}
+.folder-toggle:hover {
+  background: #eee;
+  color: #000;
+}
+.folder-toggle .caret {
+  display: inline-block;
+  font-size: 0.7rem;
+  transition: transform 0.12s ease;
+}
+.folder-toggle[aria-expanded="true"] .caret {
+  transform: rotate(90deg);
 }
 .feed-item {
   flex: 1;
