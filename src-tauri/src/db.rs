@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS folders (
 const COLUMN_MIGRATIONS: &[&str] = &[
     "ALTER TABLE feeds ADD COLUMN folder_id INTEGER REFERENCES folders(id)",
     "ALTER TABLE entries ADD COLUMN is_starred INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE feeds ADD COLUMN custom_title TEXT",
 ];
 
 /// Indexes that depend on migrated columns.
@@ -171,11 +172,12 @@ pub fn upsert_entry(
 }
 
 /// All feeds with unread entry counts, newest-fetch order not assumed (UI sorts if needed).
+/// `title` is the display title: a user-set custom title wins over the feed-provided one.
 pub fn list_feeds(conn: &Connection) -> Result<Vec<FeedDto>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.url, f.title, f.site_url, f.last_fetched_at, f.last_error, f.folder_id,
+        "SELECT f.id, f.url, COALESCE(f.custom_title, f.title), f.site_url, f.last_fetched_at, f.last_error, f.folder_id,
                 (SELECT COUNT(*) FROM entries e WHERE e.feed_id = f.id AND e.is_read = 0)
-         FROM feeds f ORDER BY f.title COLLATE NOCASE",
+         FROM feeds f ORDER BY COALESCE(f.custom_title, f.title) COLLATE NOCASE",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(FeedDto {
@@ -310,7 +312,7 @@ pub fn set_feed_fetch_result(
 
 pub fn get_feed(conn: &Connection, feed_id: i64) -> Result<Option<FeedDto>, rusqlite::Error> {
     conn.query_row(
-        "SELECT f.id, f.url, f.title, f.site_url, f.last_fetched_at, f.last_error, f.folder_id,
+        "SELECT f.id, f.url, COALESCE(f.custom_title, f.title), f.site_url, f.last_fetched_at, f.last_error, f.folder_id,
                 (SELECT COUNT(*) FROM entries e WHERE e.feed_id = f.id AND e.is_read = 0)
          FROM feeds f WHERE f.id = ?1",
         params![feed_id],
@@ -344,6 +346,46 @@ pub fn all_feed_ids_and_urls(conn: &Connection) -> Result<Vec<(i64, String)>, ru
     let mut stmt = conn.prepare("SELECT id, url FROM feeds")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     rows.collect()
+}
+
+/// `(id, url)` for every feed assigned to a folder. Errors when the folder
+/// does not exist.
+pub fn feed_ids_and_urls_in_folder(
+    conn: &Connection,
+    folder_id: i64,
+) -> Result<Vec<(i64, String)>, String> {
+    let exists: i64 = conn
+        .query_row("SELECT COUNT(*) FROM folders WHERE id = ?1", params![folder_id], |r| {
+            r.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    if exists == 0 {
+        return Err(format!("folder {folder_id} not found"));
+    }
+    let mut stmt = conn
+        .prepare("SELECT id, url FROM feeds WHERE folder_id = ?1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![folder_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+}
+
+/// Set (Some) or clear (None) a feed's custom display title. Empty or
+/// whitespace-only text clears it. The feed-provided `title` is never touched;
+/// subsequent fetches keep updating it while the display prefers the custom one.
+pub fn set_feed_title(conn: &Connection, feed_id: i64, title: Option<&str>) -> Result<(), String> {
+    let custom = title.map(str::trim).filter(|t| !t.is_empty());
+    let n = conn
+        .execute(
+            "UPDATE feeds SET custom_title = ?1 WHERE id = ?2",
+            params![custom, feed_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err(format!("feed {feed_id} not found"));
+    }
+    Ok(())
 }
 
 /// Create a folder. The name MUST be non-empty.
@@ -903,5 +945,58 @@ mod tests {
         set_feed_fetch_result(&conn, f, "2026-01-02T00:00:00Z", None).unwrap();
         let feed = get_feed(&conn, f).unwrap().unwrap();
         assert!(feed.last_error.is_none(), "successful refresh clears the error");
+    }
+
+    #[test]
+    fn custom_title_overrides_display_without_touching_site_title() {
+        let conn = open_memory().unwrap();
+        let id = insert_or_update_feed(&conn, "https://a.example/feed", "Site Title", None).unwrap();
+
+        set_feed_title(&conn, id, Some("  My Title  ")).unwrap();
+        let feed = get_feed(&conn, id).unwrap().unwrap();
+        assert_eq!(feed.title, "My Title", "custom title displayed (trimmed)");
+        let site: String = conn
+            .query_row("SELECT title FROM feeds WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(site, "Site Title", "feed-provided title untouched");
+
+        // A later fetch updates the site title but the display keeps the custom one.
+        insert_or_update_feed(&conn, "https://a.example/feed", "Site Title v2", None).unwrap();
+        let feed = get_feed(&conn, id).unwrap().unwrap();
+        assert_eq!(feed.title, "My Title", "custom title survives a refresh");
+        let listed = list_feeds(&conn).unwrap();
+        assert_eq!(listed[0].title, "My Title", "list_feeds resolves display title");
+
+        // Clearing reverts the display to the feed-provided title.
+        set_feed_title(&conn, id, None).unwrap();
+        let feed = get_feed(&conn, id).unwrap().unwrap();
+        assert_eq!(feed.title, "Site Title v2", "clearing reverts to site title");
+
+        // Empty/whitespace text also clears.
+        set_feed_title(&conn, id, Some("   ")).unwrap();
+        set_feed_title(&conn, id, Some("Again")).unwrap();
+        set_feed_title(&conn, id, Some("")).unwrap();
+        let feed = get_feed(&conn, id).unwrap().unwrap();
+        assert_eq!(feed.title, "Site Title v2", "empty text clears the custom title");
+
+        assert!(set_feed_title(&conn, 999, Some("X")).is_err(), "unknown feed rejected");
+    }
+
+    #[test]
+    fn feed_ids_and_urls_in_folder_lists_only_its_feeds() {
+        let conn = open_memory().unwrap();
+        let tech = create_folder(&conn, "Tech").unwrap();
+        let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
+        move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
+        // b stays uncategorized.
+
+        let targets = feed_ids_and_urls_in_folder(&conn, tech.id).unwrap();
+        assert_eq!(targets, vec![(a, "https://a.example/feed".to_string())]);
+        assert!(
+            !targets.iter().any(|(id, _)| *id == b),
+            "uncategorized feed excluded"
+        );
+        assert!(feed_ids_and_urls_in_folder(&conn, 999).is_err(), "unknown folder rejected");
     }
 }

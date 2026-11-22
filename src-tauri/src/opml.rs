@@ -352,6 +352,24 @@ mod tests {
     }
 
     #[test]
+    fn export_uses_custom_display_title() {
+        let conn = open_memory().unwrap();
+        let id = db::insert_or_update_feed(&conn, "https://a.example/feed", "Site Title", None)
+            .unwrap();
+        db::set_feed_title(&conn, id, Some("My Custom Title")).unwrap();
+
+        let exported = export_opml(&conn).unwrap();
+        assert!(
+            exported.xml.contains("text=\"My Custom Title\""),
+            "export carries the custom display title"
+        );
+        assert!(
+            !exported.xml.contains("Site Title"),
+            "the overridden site title is not exported"
+        );
+    }
+
+    #[test]
     fn export_then_import_round_trip_preserves_folders() {
         let conn = open_memory().unwrap();
         let tech = db::create_folder(&conn, "Tech & Gadgets").unwrap();

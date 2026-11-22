@@ -3,12 +3,14 @@ import { computed, onMounted, ref } from "vue";
 import Sidebar from "./components/Sidebar.vue";
 import EntryList from "./components/EntryList.vue";
 import ReadingPane from "./components/ReadingPane.vue";
+import FeedEditDialog from "./components/FeedEditDialog.vue";
 import {
   listFeeds,
   listFolders,
   listEntries,
   refreshAll,
   refreshFeed,
+  refreshFolder,
   removeFeed,
   setRead,
   setStarred,
@@ -29,6 +31,7 @@ const selectedEntryId = ref<number | null>(null);
 const view = ref<EntryView>("all");
 const busy = ref(false);
 const loadError = ref<string | null>(null);
+const editingFeed = ref<Feed | null>(null);
 
 const selectedEntry = computed(
   () => entries.value.find((e) => e.id === selectedEntryId.value) ?? null,
@@ -170,6 +173,27 @@ async function doRefreshOne(feedId: number) {
   }
 }
 
+async function doRefreshFolder(folderId: number) {
+  busy.value = true;
+  try {
+    const outcomes = await refreshFolder(folderId);
+    const failed = outcomes.filter((o) => o.error !== null).length;
+    alert(
+      `${outcomes.length - failed} feed(s) refreshed, ${failed} failed`,
+    );
+    await reload();
+  } catch (e) {
+    loadError.value = String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+function onFeedSaved() {
+  editingFeed.value = null;
+  void reload();
+}
+
 async function doRemove(feedId: number) {
   try {
     await removeFeed(feedId);
@@ -206,6 +230,8 @@ onMounted(reload);
       @changed="reload"
       @remove="doRemove"
       @refresh-one="doRefreshOne"
+      @refresh-folder="doRefreshFolder"
+      @edit="editingFeed = $event"
     />
     <EntryList
       :entries="entries"
@@ -222,6 +248,13 @@ onMounted(reload);
       :feed="selectedFeed"
       @toggle-read="toggleRead"
       @open-link="openLink"
+    />
+    <FeedEditDialog
+      v-if="editingFeed"
+      :feed="editingFeed"
+      :folders="folders"
+      @close="editingFeed = null"
+      @saved="onFeedSaved"
     />
   </main>
 </template>

@@ -128,6 +128,37 @@ async fn refresh_feed(app: tauri::AppHandle, feed_id: i64) -> Result<(), String>
     reader::refresh_feed(conn, feed_id).await
 }
 
+/// Refresh every feed under a folder. Per-feed outcomes are included so the
+/// frontend can summarize successes and failures in one alert.
+#[tauri::command]
+async fn refresh_folder(
+    app: tauri::AppHandle,
+    folder_id: i64,
+) -> Result<Vec<reader::RefreshOutcome>, String> {
+    let conn = shared_conn(&app)?;
+    let results = reader::refresh_folder(conn, folder_id).await?;
+    Ok(results
+        .into_iter()
+        .map(|(feed_id, result)| reader::RefreshOutcome {
+            feed_id,
+            error: result.err(),
+        })
+        .collect())
+}
+
+/// Set or clear a feed's custom display title (`title: null` reverts to the
+/// feed-provided title).
+#[tauri::command]
+fn set_feed_title(
+    app: tauri::AppHandle,
+    feed_id: i64,
+    title: Option<String>,
+) -> Result<(), String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::set_feed_title(&guard, feed_id, title.as_deref())
+}
+
 /// Refresh all feeds. Never fails as a whole; per-feed outcomes are included
 /// and each feed's error is already recorded in the database.
 #[tauri::command]
@@ -173,6 +204,7 @@ pub fn run() {
             rename_folder,
             delete_folder,
             move_feed_to_folder,
+            set_feed_title,
             set_read,
             set_starred,
             import_opml,
@@ -180,7 +212,8 @@ pub fn run() {
             remove_feed,
             add_feed,
             refresh_feed,
-            refresh_all
+            refresh_all,
+            refresh_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

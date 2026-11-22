@@ -31,7 +31,29 @@ pub async fn refresh_all(conn: SharedConn) -> Vec<(i64, Result<(), String>)> {
             Err(_) => return vec![],
         }
     };
+    refresh_targets(conn, targets).await
+}
 
+/// Refresh every feed assigned to a folder with the same bounded concurrency
+/// and per-feed failure isolation as a full refresh. Returns (feed_id, result)
+/// for each of the folder's feeds. Errors when the folder is unknown.
+pub async fn refresh_folder(
+    conn: SharedConn,
+    folder_id: i64,
+) -> Result<Vec<(i64, Result<(), String>)>, String> {
+    let targets = {
+        let guard = conn.lock().map_err(|e| e.to_string())?;
+        db::feed_ids_and_urls_in_folder(&guard, folder_id)?
+    };
+    Ok(refresh_targets(conn, targets).await)
+}
+
+/// Refresh a target list concurrently with a bounded worker set.
+/// Each feed's outcome is recorded independently; never fails as a whole.
+async fn refresh_targets(
+    conn: SharedConn,
+    targets: Vec<(i64, String)>,
+) -> Vec<(i64, Result<(), String>)> {
     let mut results = Vec::with_capacity(targets.len());
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut pending = targets.into_iter();
@@ -339,6 +361,47 @@ mod tests {
             other.last_error.as_deref(),
             Some("old error"),
             "untouched feed keeps its previous state"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_folder_touches_only_its_feeds() {
+        let base = serve(vec![("/good.xml", FEED_A.to_string())]);
+        let conn = shared();
+        let folder_id;
+        let in_folder = {
+            let guard = conn.lock().unwrap();
+            folder_id = db::create_folder(&guard, "Tech").unwrap().id;
+            let id =
+                db::insert_or_update_feed(&guard, &format!("{base}/good.xml"), "Good", None)
+                    .unwrap();
+            db::move_feed_to_folder(&guard, id, Some(folder_id)).unwrap();
+            id
+        };
+        let outside = {
+            let guard = conn.lock().unwrap();
+            db::insert_or_update_feed(&guard, "http://127.0.0.1:9/outside.xml", "Outside", None)
+                .unwrap()
+        };
+
+        let results = refresh_folder(conn.clone(), folder_id).await.unwrap();
+        assert_eq!(results.len(), 1, "only the folder's feeds get an outcome");
+        assert_eq!(results[0].0, in_folder);
+        assert!(results[0].1.is_ok(), "folder feed refreshed");
+
+        let guard = conn.lock().unwrap();
+        let inside = db::get_feed(&guard, in_folder).unwrap().unwrap();
+        assert!(inside.last_fetched_at.is_some());
+        let other = db::get_feed(&guard, outside).unwrap().unwrap();
+        assert!(
+            other.last_fetched_at.is_none() && other.last_error.is_none(),
+            "feed outside the folder is never fetched"
+        );
+        drop(guard);
+
+        assert!(
+            refresh_folder(conn.clone(), 999).await.is_err(),
+            "unknown folder rejected"
         );
     }
 

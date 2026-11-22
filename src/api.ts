@@ -88,6 +88,11 @@ export function refreshAll(): Promise<RefreshOutcome[]> {
   return invoke<RefreshOutcome[]>("refresh_all");
 }
 
+/** Refresh every feed under a folder; resolves with per-feed outcomes. */
+export function refreshFolder(folderId: number): Promise<RefreshOutcome[]> {
+  return invoke<RefreshOutcome[]>("refresh_folder", { folderId });
+}
+
 export interface ImportOutcome {
   feeds_added: number;
   feeds_skipped: number;
@@ -115,6 +120,15 @@ export function moveFeedToFolder(
   folderId: number | null,
 ): Promise<void> {
   return invoke("move_feed_to_folder", { feedId, folderId });
+}
+
+/** Set a feed's custom display title, or clear it with `null` to revert
+ * to the title provided by the feed. */
+export function setFeedTitle(
+  feedId: number,
+  title: string | null,
+): Promise<void> {
+  return invoke("set_feed_title", { feedId, title });
 }
 
 /** Import an OPML file. Merge-only; does not fetch any feed. */

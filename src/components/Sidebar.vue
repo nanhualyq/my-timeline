@@ -6,12 +6,12 @@ import {
   deleteFolder,
   exportOpml,
   importOpml,
-  moveFeedToFolder,
   renameFolder,
   type Feed,
   type Folder,
   type Selection,
 } from "../api";
+import RowMenu from "./RowMenu.vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 
 const props = defineProps<{
@@ -26,6 +26,8 @@ const emit = defineEmits<{
   changed: [];
   remove: [feedId: number];
   refreshOne: [feedId: number];
+  refreshFolder: [folderId: number];
+  edit: [feed: Feed];
 }>();
 
 const newUrl = ref("");
@@ -86,12 +88,16 @@ function confirmDeleteFolder(folder: Folder) {
   }
 }
 
-function onMoveFeed(feed: Feed, event: Event) {
-  const select = event.target as HTMLSelectElement;
-  const value = select.value;
-  const folderId = value === "" ? null : Number(value);
-  if (folderId === feed.folder_id) return;
-  void runAction(() => moveFeedToFolder(feed.id, folderId));
+function onFolderMenu(key: string, folder: Folder) {
+  if (key === "refresh") emit("refreshFolder", folder.id);
+  else if (key === "rename") renameFolderAction(folder);
+  else if (key === "delete") confirmDeleteFolder(folder);
+}
+
+function onFeedMenu(key: string, feed: Feed) {
+  if (key === "edit") emit("edit", feed);
+  else if (key === "refresh") emit("refreshOne", feed.id);
+  else if (key === "remove") confirmRemove(feed);
 }
 
 async function doImport() {
@@ -132,6 +138,18 @@ async function doExport() {
 const uncategorized = computed(() =>
   props.feeds.filter((f) => f.folder_id === null),
 );
+
+const folderMenuItems = [
+  { key: "refresh", label: "Refresh folder" },
+  { key: "rename", label: "Rename" },
+  { key: "delete", label: "Delete", danger: true },
+];
+
+const feedMenuItems = [
+  { key: "edit", label: "Edit\u2026" },
+  { key: "refresh", label: "Refresh" },
+  { key: "remove", label: "Remove", danger: true },
+];
 
 type SidebarItem =
   | { key: string; type: "label"; label: string }
@@ -248,24 +266,12 @@ const items = computed<SidebarItem[]>(() => {
               {{ item.folder.unread_count }}
             </span>
           </button>
-          <span class="feed-actions">
-            <button
-              class="icon-btn"
-              title="Rename folder"
-              :disabled="busy"
-              @click="renameFolderAction(item.folder)"
-            >
-              &#x270e;
-            </button>
-            <button
-              class="icon-btn"
-              title="Delete folder (feeds move to Uncategorized)"
-              :disabled="busy"
-              @click="confirmDeleteFolder(item.folder)"
-            >
-              &times;
-            </button>
-          </span>
+          <RowMenu
+            :items="folderMenuItems"
+            trigger-title="Folder actions"
+            :disabled="busy"
+            @select="(key) => onFolderMenu(key, item.folder)"
+          />
         </div>
 
         <div
@@ -287,35 +293,12 @@ const items = computed<SidebarItem[]>(() => {
               {{ item.feed.unread_count }}
             </span>
           </button>
-          <span class="feed-actions">
-            <button
-              class="icon-btn"
-              title="Refresh this feed"
-              :disabled="busy"
-              @click="emit('refreshOne', item.feed.id)"
-            >
-              &#x21bb;
-            </button>
-            <select
-              class="move-select"
-              title="Move to folder"
-              :value="item.feed.folder_id === null ? '' : String(item.feed.folder_id)"
-              :disabled="busy"
-              @change="onMoveFeed(item.feed, $event)"
-            >
-              <option value="">Unfiled</option>
-              <option v-for="f in folders" :key="f.id" :value="String(f.id)">
-                {{ f.name }}
-              </option>
-            </select>
-            <button
-              class="icon-btn"
-              title="Remove feed"
-              @click="confirmRemove(item.feed)"
-            >
-              &times;
-            </button>
-          </span>
+          <RowMenu
+            :items="feedMenuItems"
+            trigger-title="Feed actions"
+            :disabled="busy"
+            @select="(key) => onFeedMenu(key, item.feed)"
+          />
           <span
             v-if="item.feed.last_error"
             class="error-dot"
@@ -445,12 +428,6 @@ const items = computed<SidebarItem[]>(() => {
   padding: 0 0.45rem;
   flex-shrink: 0;
 }
-.feed-actions {
-  display: flex;
-  align-items: center;
-  gap: 1px;
-  flex-shrink: 0;
-}
 .icon-btn {
   border: none;
   background: transparent;
@@ -467,24 +444,6 @@ const items = computed<SidebarItem[]>(() => {
 .icon-btn:disabled {
   opacity: 0.35;
   cursor: default;
-}
-.move-select {
-  max-width: 4.5rem;
-  font-size: 0.68rem;
-  padding: 0.1rem 0.15rem;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: transparent;
-  color: #666;
-  cursor: pointer;
-  opacity: 0;
-}
-.feed-row:hover .move-select,
-.move-select:focus {
-  opacity: 1;
-}
-.move-select option {
-  color: #000;
 }
 .error-dot {
   width: 8px;
