@@ -8,6 +8,7 @@ import {
   type Selection,
 } from "../api";
 import RowMenu from "./RowMenu.vue";
+import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 
 const props = defineProps<{
   feeds: Feed[];
@@ -43,10 +44,16 @@ function toggleFolder(folderId: number) {
   expandedFolders.value = next;
 }
 
-function confirmRemove(feed: Feed) {
-  if (confirm(`Remove subscription "${feed.title}"?`)) {
-    emit("remove", feed.id);
-  }
+// tauri-plugin-dialog replaces window.confirm with an async wrapper that
+// returns a Promise (always truthy), so the native confirm() never blocks
+// and a delete would run without waiting for the user. Ask through the
+// plugin and await the answer instead.
+async function confirmRemove(feed: Feed) {
+  const ok = await confirmDialog(`Remove subscription "${feed.title}"?`, {
+    title: "Remove subscription",
+    kind: "warning",
+  });
+  if (ok) emit("remove", feed.id);
 }
 
 /** Run a folder action, surface errors, then ask the app to reload. */
@@ -66,24 +73,24 @@ function renameFolderAction(folder: Folder) {
   void runAction(() => renameFolder(folder.id, name));
 }
 
-function confirmDeleteFolder(folder: Folder) {
-  if (
-    confirm(`Delete folder "${folder.name}"? Its feeds move to Uncategorized.`)
-  ) {
-    void runAction(() => deleteFolder(folder.id));
-  }
+async function confirmDeleteFolder(folder: Folder) {
+  const ok = await confirmDialog(
+    `Delete folder "${folder.name}"? Its feeds move to Uncategorized.`,
+    { title: "Delete folder", kind: "warning" },
+  );
+  if (ok) void runAction(() => deleteFolder(folder.id));
 }
 
 function onFolderMenu(key: string, folder: Folder) {
   if (key === "refresh") emit("refreshFolder", folder.id);
   else if (key === "rename") renameFolderAction(folder);
-  else if (key === "delete") confirmDeleteFolder(folder);
+  else if (key === "delete") void confirmDeleteFolder(folder);
 }
 
 function onFeedMenu(key: string, feed: Feed) {
   if (key === "edit") emit("edit", feed);
   else if (key === "refresh") emit("refreshOne", feed.id);
-  else if (key === "remove") confirmRemove(feed);
+  else if (key === "remove") void confirmRemove(feed);
 }
 
 const uncategorized = computed(() =>

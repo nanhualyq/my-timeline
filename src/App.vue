@@ -25,6 +25,7 @@ import {
   type Selection,
 } from "./api";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { message } from "@tauri-apps/plugin-dialog";
 
 const feeds = ref<Feed[]>([]);
 const folders = ref<Folder[]>([]);
@@ -217,9 +218,9 @@ async function doRefreshFolder(folderId: number) {
   try {
     const outcomes = await refreshFolder(folderId);
     const failed = outcomes.filter((o) => o.error !== null).length;
-    alert(
-      `${outcomes.length - failed} feed(s) refreshed, ${failed} failed`,
-    );
+    // window.alert is overridden by tauri-plugin-dialog into a fire-and-forget
+    // call, so await the plugin dialog to keep it in step with the reload.
+    await message(`${outcomes.length - failed} feed(s) refreshed, ${failed} failed`);
     await reload();
   } catch (e) {
     loadError.value = String(e);
