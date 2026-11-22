@@ -5,39 +5,75 @@ import EntryList from "./components/EntryList.vue";
 import ReadingPane from "./components/ReadingPane.vue";
 import {
   listFeeds,
+  listFolders,
   listEntries,
   refreshAll,
   refreshFeed,
   removeFeed,
   setRead,
+  setStarred,
   type Entry,
+  type EntryScope,
+  type EntryView,
   type Feed,
+  type Folder,
+  type Selection,
 } from "./api";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 const feeds = ref<Feed[]>([]);
+const folders = ref<Folder[]>([]);
 const entries = ref<Entry[]>([]);
-const selectedFeedId = ref<number | null>(null);
+const selection = ref<Selection>({ kind: "all" });
 const selectedEntryId = ref<number | null>(null);
-const view = ref<"all" | "unread">("all");
+const view = ref<EntryView>("all");
 const busy = ref(false);
 const loadError = ref<string | null>(null);
 
 const selectedEntry = computed(
   () => entries.value.find((e) => e.id === selectedEntryId.value) ?? null,
 );
-const selectedFeed = computed(
-  () => feeds.value.find((f) => f.id === selectedFeedId.value) ?? null,
-);
+// The reading pane names the entry's own feed, so it works in every view.
+const selectedFeed = computed(() => {
+  const entry = selectedEntry.value;
+  if (!entry) return null;
+  return feeds.value.find((f) => f.id === entry.feed_id) ?? null;
+});
+
+function scopeOf(sel: Selection): EntryScope {
+  switch (sel.kind) {
+    case "all":
+      return { kind: "all" };
+    case "starred":
+      return { kind: "starred" };
+    case "folder":
+      return { kind: "folder", id: sel.id };
+    case "feed":
+      return { kind: "feed", id: sel.id };
+  }
+}
+
+function isGlobal(sel: Selection): boolean {
+  return sel.kind === "all" || sel.kind === "starred";
+}
+
+async function refreshCounts() {
+  feeds.value = await listFeeds();
+  folders.value = await listFolders();
+}
 
 async function reload() {
   try {
-    feeds.value = await listFeeds();
-    // Per-feed selection shows that feed; otherwise the active tab applies.
-    entries.value = await listEntries(
-      selectedFeedId.value === null ? view.value : "all",
-      selectedFeedId.value ?? undefined,
-    );
+    await refreshCounts();
+    // A deleted folder must not leave a dangling selection behind.
+    const sel = selection.value;
+    if (sel.kind === "folder" && !folders.value.some((f) => f.id === sel.id)) {
+      selection.value = { kind: "all" };
+    }
+    // The all/unread tabs apply to the global views; feed and folder
+    // selections always show that scope's full list (pre-existing behavior).
+    const activeView: EntryView = isGlobal(selection.value) ? view.value : "all";
+    entries.value = await listEntries(activeView, scopeOf(selection.value));
     loadError.value = null;
     // Keep the open entry if it still exists; otherwise clear the pane.
     if (
@@ -51,17 +87,18 @@ async function reload() {
   }
 }
 
-function selectFeed(feedId: number | null) {
-  selectedFeedId.value = feedId;
+function select(sel: Selection) {
+  selection.value = sel;
   selectedEntryId.value = null;
   void reload();
 }
 
-function setView(v: "all" | "unread") {
+function setView(v: EntryView) {
   view.value = v;
-  // Tab only applies to the global list; feed selection has its own scope.
-  if (selectedFeedId.value !== null) {
-    selectedFeedId.value = null;
+  // Tabs only apply to the global views; a feed/folder selection falls back
+  // to "All entries" (the starred view keeps its scope).
+  if (!isGlobal(selection.value)) {
+    selection.value = { kind: "all" };
   }
   void reload();
 }
@@ -78,7 +115,7 @@ async function applyRead(entry: Entry, isRead: boolean) {
     await setRead(entry.id, isRead);
     entry.is_read = isRead;
     // Refresh counts in the sidebar without resetting selection.
-    feeds.value = await listFeeds();
+    await refreshCounts();
   } catch (e) {
     loadError.value = String(e);
   }
@@ -87,6 +124,26 @@ async function applyRead(entry: Entry, isRead: boolean) {
 function toggleRead() {
   const entry = selectedEntry.value;
   if (entry) void applyRead(entry, !entry.is_read);
+}
+
+async function toggleStar(entry: Entry) {
+  try {
+    const next = !entry.is_starred;
+    await setStarred(entry.id, next);
+    entry.is_starred = next;
+    // Leaving the starred view must drop the entry from its list.
+    if (selection.value.kind === "starred") {
+      entries.value = await listEntries(view.value, { kind: "starred" });
+      if (
+        selectedEntryId.value !== null &&
+        !entries.value.some((e) => e.id === selectedEntryId.value)
+      ) {
+        selectedEntryId.value = null;
+      }
+    }
+  } catch (e) {
+    loadError.value = String(e);
+  }
 }
 
 async function doRefreshAll() {
@@ -116,8 +173,8 @@ async function doRefreshOne(feedId: number) {
 async function doRemove(feedId: number) {
   try {
     await removeFeed(feedId);
-    if (selectedFeedId.value === feedId) {
-      selectedFeedId.value = null;
+    if (selection.value.kind === "feed" && selection.value.id === feedId) {
+      selection.value = { kind: "all" };
       selectedEntryId.value = null;
     }
     await reload();
@@ -142,9 +199,10 @@ onMounted(reload);
     <p v-if="loadError" class="global-error">{{ loadError }}</p>
     <Sidebar
       :feeds="feeds"
-      :selected-feed-id="selectedFeedId"
+      :folders="folders"
+      :selection="selection"
       :busy="busy"
-      @select="selectFeed"
+      @select="select"
       @changed="reload"
       @remove="doRemove"
       @refresh-one="doRefreshOne"
@@ -155,6 +213,7 @@ onMounted(reload);
       :view="view"
       :busy="busy"
       @select="selectEntry"
+      @toggle-star="toggleStar"
       @refresh-all="doRefreshAll"
       @set-view="setView"
     />

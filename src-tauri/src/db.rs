@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const SCHEMA: &str = "
@@ -28,9 +28,40 @@ CREATE INDEX IF NOT EXISTS idx_entries_feed ON entries(feed_id, published_at DES
 CREATE INDEX IF NOT EXISTS idx_entries_read ON entries(is_read, published_at DESC);
 ";
 
-/// Create the schema in an already-open connection.
+/// Folders group feeds; a NULL `feeds.folder_id` means uncategorized.
+pub const FOLDERS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS folders (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+";
+
+/// Columns added after the original schema shipped. Applied on every open;
+/// each statement is skipped when the column already exists.
+const COLUMN_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE feeds ADD COLUMN folder_id INTEGER REFERENCES folders(id)",
+    "ALTER TABLE entries ADD COLUMN is_starred INTEGER NOT NULL DEFAULT 0",
+];
+
+/// Indexes that depend on migrated columns.
+const POST_MIGRATION: &str = "
+CREATE INDEX IF NOT EXISTS idx_entries_starred ON entries(is_starred, published_at DESC);
+";
+
+/// Create the schema in an already-open connection. Safe to call on every open:
+/// all statements are idempotent and column migrations tolerate being re-run.
 pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(SCHEMA)
+    conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(FOLDERS_TABLE)?;
+    for sql in COLUMN_MIGRATIONS {
+        match conn.execute_batch(sql) {
+            Ok(()) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    conn.execute_batch(POST_MIGRATION)
 }
 
 /// Open (creating if needed) the application database at `path` and apply the schema.
@@ -61,7 +92,18 @@ pub struct FeedDto {
     pub site_url: Option<String>,
     pub last_fetched_at: Option<String>,
     pub last_error: Option<String>,
+    /// NULL means uncategorized.
+    pub folder_id: Option<i64>,
     pub unread_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderDto {
+    pub id: i64,
+    pub name: String,
+    pub position: i64,
+    pub unread_count: i64,
+    pub feeds: Vec<FeedDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +115,20 @@ pub struct EntryDto {
     pub content_html: String,
     pub published_at: Option<String>,
     pub is_read: bool,
+    pub is_starred: bool,
+}
+
+/// What set of entries to list. Serialized from the frontend as
+/// `{kind:"all"}` / `{kind:"feed",id}` / `{kind:"folder",id}` /
+/// `{kind:"starred"}` — the starred view is global and never combines with
+/// a feed or folder selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum EntryScope {
+    All,
+    Feed { id: i64 },
+    Folder { id: i64 },
+    Starred,
 }
 
 /// Insert a feed or update its title/site_url if the URL already exists. Returns the feed id.
@@ -119,7 +175,7 @@ pub fn upsert_entry(
 /// All feeds with unread entry counts, newest-fetch order not assumed (UI sorts if needed).
 pub fn list_feeds(conn: &Connection) -> Result<Vec<FeedDto>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.url, f.title, f.site_url, f.last_fetched_at, f.last_error,
+        "SELECT f.id, f.url, f.title, f.site_url, f.last_fetched_at, f.last_error, f.folder_id,
                 (SELECT COUNT(*) FROM entries e WHERE e.feed_id = f.id AND e.is_read = 0)
          FROM feeds f ORDER BY f.title COLLATE NOCASE",
     )?;
@@ -131,49 +187,61 @@ pub fn list_feeds(conn: &Connection) -> Result<Vec<FeedDto>, rusqlite::Error> {
             site_url: r.get(3)?,
             last_fetched_at: r.get(4)?,
             last_error: r.get(5)?,
-            unread_count: r.get(6)?,
+            folder_id: r.get(6)?,
+            unread_count: r.get(7)?,
         })
     })?;
     rows.collect()
 }
 
-/// List entries. `view` is "all" or "unread"; when `feed_id` is given only that
-/// feed's entries are returned (all states), otherwise `view` filters globally.
+/// List entries for a scope combined with a view (`"all"` or `"unread"`).
+/// Newest first. The starred scope is independent of feed/folder selection.
 pub fn list_entries(
     conn: &Connection,
     view: &str,
-    feed_id: Option<i64>,
+    scope: EntryScope,
 ) -> Result<Vec<EntryDto>, String> {
-    let sql: &str = match (view, feed_id) {
-        (_, Some(_)) =>
-            "SELECT id, feed_id, title, link, content_html, published_at, is_read
-             FROM entries WHERE feed_id = ?1 ORDER BY published_at DESC, id DESC",
-        ("unread", None) =>
-            "SELECT id, feed_id, title, link, content_html, published_at, is_read
-             FROM entries WHERE is_read = 0 ORDER BY published_at DESC, id DESC",
-        ("all", None) =>
-            "SELECT id, feed_id, title, link, content_html, published_at, is_read
-             FROM entries ORDER BY published_at DESC, id DESC",
-        _ => return Err(format!("unknown view: {view}")),
+    if view != "all" && view != "unread" {
+        return Err(format!("unknown view: {view}"));
+    }
+    let mut conditions: Vec<&str> = Vec::new();
+    let mut id_params: Vec<i64> = Vec::new();
+    match scope {
+        EntryScope::All => {}
+        EntryScope::Feed { id } => {
+            conditions.push("feed_id = ?");
+            id_params.push(id);
+        }
+        EntryScope::Folder { id } => {
+            conditions.push("feed_id IN (SELECT id FROM feeds WHERE folder_id = ?)");
+            id_params.push(id);
+        }
+        EntryScope::Starred => conditions.push("is_starred = 1"),
+    }
+    if view == "unread" {
+        conditions.push("is_read = 0");
+    }
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
     };
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    let rows = match feed_id {
-        Some(id) => stmt
-            .query_map(params![id], map_entry)
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?,
-        None => stmt
-            .query_map([], map_entry)
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?,
-    };
-    Ok(rows)
+    let sql = format!(
+        "SELECT id, feed_id, title, link, content_html, published_at, is_read, is_starred
+         FROM entries {where_clause} ORDER BY published_at DESC, id DESC"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        id_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    stmt.query_map(param_refs.as_slice(), map_entry)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntryDto> {
     let is_read: i64 = r.get(6)?;
+    let is_starred: i64 = r.get(7)?;
     Ok(EntryDto {
         id: r.get(0)?,
         feed_id: r.get(1)?,
@@ -182,6 +250,7 @@ fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntryDto> {
         content_html: r.get(4)?,
         published_at: r.get(5)?,
         is_read: is_read != 0,
+        is_starred: is_starred != 0,
     })
 }
 
@@ -194,6 +263,24 @@ pub fn set_read(
         .execute(
             "UPDATE entries SET is_read = ?1 WHERE id = ?2",
             params![is_read as i64, entry_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err(format!("entry {entry_id} not found"));
+    }
+    Ok(())
+}
+
+/// Star or unstar an entry. Independent of read state.
+pub fn set_starred(
+    conn: &Connection,
+    entry_id: i64,
+    is_starred: bool,
+) -> Result<(), String> {
+    let n = conn
+        .execute(
+            "UPDATE entries SET is_starred = ?1 WHERE id = ?2",
+            params![is_starred as i64, entry_id],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {
@@ -225,7 +312,7 @@ pub fn set_feed_fetch_result(
 
 pub fn get_feed(conn: &Connection, feed_id: i64) -> Result<Option<FeedDto>, rusqlite::Error> {
     conn.query_row(
-        "SELECT f.id, f.url, f.title, f.site_url, f.last_fetched_at, f.last_error,
+        "SELECT f.id, f.url, f.title, f.site_url, f.last_fetched_at, f.last_error, f.folder_id,
                 (SELECT COUNT(*) FROM entries e WHERE e.feed_id = f.id AND e.is_read = 0)
          FROM feeds f WHERE f.id = ?1",
         params![feed_id],
@@ -237,7 +324,8 @@ pub fn get_feed(conn: &Connection, feed_id: i64) -> Result<Option<FeedDto>, rusq
                 site_url: r.get(3)?,
                 last_fetched_at: r.get(4)?,
                 last_error: r.get(5)?,
-                unread_count: r.get(6)?,
+                folder_id: r.get(6)?,
+                unread_count: r.get(7)?,
             })
         },
     )
@@ -258,6 +346,149 @@ pub fn all_feed_ids_and_urls(conn: &Connection) -> Result<Vec<(i64, String)>, ru
     let mut stmt = conn.prepare("SELECT id, url FROM feeds")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     rows.collect()
+}
+
+/// Create a folder. The name MUST be non-empty; position is appended last.
+pub fn create_folder(conn: &Connection, name: &str) -> Result<FolderDto, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("folder name is empty".into());
+    }
+    conn.execute(
+        "INSERT INTO folders (name, position)
+         VALUES (?1, (SELECT COALESCE(MAX(position), -1) + 1 FROM folders))",
+        params![name],
+    )
+    .map_err(|e| e.to_string())?;
+    let id = conn
+        .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok(FolderDto { id, name: name.into(), position: 0, unread_count: 0, feeds: vec![] })
+}
+
+/// Rename a folder. The new name MUST be non-empty.
+pub fn rename_folder(conn: &Connection, folder_id: i64, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("folder name is empty".into());
+    }
+    let n = conn
+        .execute(
+            "UPDATE folders SET name = ?1 WHERE id = ?2",
+            params![name, folder_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err(format!("folder {folder_id} not found"));
+    }
+    Ok(())
+}
+
+/// Delete a folder. Its feeds move to uncategorized (folder_id = NULL);
+/// feeds and entries are never removed by this operation.
+pub fn delete_folder(conn: &Connection, folder_id: i64) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE feeds SET folder_id = NULL WHERE folder_id = ?1",
+        params![folder_id],
+    )
+    .map_err(|e| e.to_string())?;
+    let n = tx
+        .execute("DELETE FROM folders WHERE id = ?1", params![folder_id])
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err(format!("folder {folder_id} not found"));
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+/// Set the folder display order. `ordered_ids` MUST list every folder id
+/// exactly once; positions become the slice indices.
+pub fn reorder_folders(conn: &Connection, ordered_ids: &[i64]) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    for (position, id) in ordered_ids.iter().enumerate() {
+        let n = tx
+            .execute(
+                "UPDATE folders SET position = ?1 WHERE id = ?2",
+                params![position as i64, id],
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("folder {id} not found"));
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+/// Move a feed to a folder, or to uncategorized when `folder_id` is None.
+pub fn move_feed_to_folder(
+    conn: &Connection,
+    feed_id: i64,
+    folder_id: Option<i64>,
+) -> Result<(), String> {
+    if let Some(fid) = folder_id {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE id = ?1",
+                params![fid],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?
+            > 0;
+        if !exists {
+            return Err(format!("folder {fid} not found"));
+        }
+    }
+    let n = conn
+        .execute(
+            "UPDATE feeds SET folder_id = ?1 WHERE id = ?2",
+            params![folder_id, feed_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err(format!("feed {feed_id} not found"));
+    }
+    Ok(())
+}
+
+/// Folders ordered by position, each with its feeds (title order) nested and
+/// an unread count aggregated over those feeds in SQL. Uncategorized feeds are
+/// not included here; they are the feeds with `folder_id == None`.
+pub fn list_folders(conn: &Connection) -> Result<Vec<FolderDto>, String> {
+    let mut folders: Vec<FolderDto> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, f.name, f.position,
+                        (SELECT COUNT(*) FROM entries e
+                          JOIN feeds fd ON e.feed_id = fd.id
+                          WHERE fd.folder_id = f.id AND e.is_read = 0)
+                 FROM folders f ORDER BY f.position, f.id",
+            )
+            .map_err(|e| e.to_string())?;
+        stmt
+            .query_map([], |r| {
+                Ok(FolderDto {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    position: r.get(2)?,
+                    unread_count: r.get(3)?,
+                    feeds: vec![],
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?
+    };
+
+    let feeds = list_feeds(conn).map_err(|e| e.to_string())?;
+    for feed in feeds {
+        if let Some(folder_id) = feed.folder_id {
+            if let Some(folder) = folders.iter_mut().find(|f| f.id == folder_id) {
+                folder.feeds.push(feed);
+            }
+        }
+    }
+    Ok(folders)
 }
 
 #[cfg(test)]
@@ -295,6 +526,145 @@ mod tests {
         assert_eq!(entries, 1);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_creates_folders_and_migrated_columns() {
+        let conn = open_memory().unwrap();
+        let folders: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='folders'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(folders, 1);
+
+        let feed_cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(feeds)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(feed_cols.contains(&"folder_id".to_string()));
+
+        let entry_cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(entries)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(entry_cols.contains(&"is_starred".to_string()));
+    }
+
+    #[test]
+    fn init_schema_is_idempotent_on_existing_databases() {
+        // Simulate a pre-upgrade database: original schema only, no folders.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        // Two upgrade passes must both succeed (duplicate column tolerated).
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+
+        let starred: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name='is_starred'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(starred, 1);
+    }
+
+    #[test]
+    fn folder_crud_and_feed_assignment() {
+        let conn = open_memory().unwrap();
+        let tech = create_folder(&conn, "Tech").unwrap();
+        let blogs = create_folder(&conn, " Blogs ").unwrap();
+        assert_eq!(blogs.name, "Blogs", "name is trimmed");
+
+        // Position: appended in creation order.
+        let folders = list_folders(&conn).unwrap();
+        let ids: Vec<i64> = folders.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![tech.id, blogs.id]);
+        assert_eq!(folders[0].position, 0);
+        assert_eq!(folders[1].position, 1);
+
+        assert!(create_folder(&conn, "   ").is_err(), "empty name rejected");
+        assert!(rename_folder(&conn, tech.id, "").is_err(), "empty rename rejected");
+        rename_folder(&conn, tech.id, "Technology").unwrap();
+        assert!(rename_folder(&conn, 999, "X").is_err(), "unknown folder rejected");
+
+        let feed = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        move_feed_to_folder(&conn, feed, Some(tech.id)).unwrap();
+        let a = get_feed(&conn, feed).unwrap().unwrap();
+        assert_eq!(a.folder_id, Some(tech.id));
+
+        assert!(move_feed_to_folder(&conn, feed, Some(999)).is_err(), "unknown folder rejected");
+        assert!(move_feed_to_folder(&conn, 999, None).is_err(), "unknown feed rejected");
+
+        reorder_folders(&conn, &[blogs.id, tech.id]).unwrap();
+        let folders = list_folders(&conn).unwrap();
+        assert_eq!(folders[0].id, blogs.id);
+        assert_eq!(folders[1].id, tech.id);
+        assert!(reorder_folders(&conn, &[999]).is_err(), "unknown id rejected");
+
+        // Deleting the folder reassigns its feed to uncategorized.
+        delete_folder(&conn, tech.id).unwrap();
+        let a = get_feed(&conn, feed).unwrap().unwrap();
+        assert_eq!(a.folder_id, None, "feed moves to uncategorized");
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "no entries touched");
+        let feed_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feeds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(feed_rows, 1, "feed survives folder deletion");
+        assert!(delete_folder(&conn, tech.id).is_err(), "double delete rejected");
+    }
+
+    #[test]
+    fn list_folders_aggregates_unread_and_excludes_uncategorized() {
+        let conn = open_memory().unwrap();
+        let tech = create_folder(&conn, "Tech").unwrap();
+        let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
+        let c = insert_or_update_feed(&conn, "https://c.example/feed", "C", None).unwrap();
+        move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
+        move_feed_to_folder(&conn, b, Some(tech.id)).unwrap();
+
+        upsert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
+        upsert_entry(&conn, a, "g2", "T", None, "<p>x</p>", None).unwrap();
+        upsert_entry(&conn, b, "g3", "T", None, "<p>x</p>", None).unwrap();
+        upsert_entry(&conn, c, "g4", "T", None, "<p>x</p>", None).unwrap();
+
+        let folders = list_folders(&conn).unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].unread_count, 3, "aggregated over the folder's feeds");
+        assert_eq!(folders[0].feeds.len(), 2, "both assigned feeds nested");
+
+        // Uncategorized feed is visible via list_feeds, not via any folder.
+        let uncategorized: Vec<_> = list_feeds(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.folder_id.is_none())
+            .collect();
+        assert_eq!(uncategorized.len(), 1);
+        assert_eq!(uncategorized[0].id, c);
+
+        // Unread count tracks read state.
+        set_read(&conn, 1, true).unwrap();
+        let folders = list_folders(&conn).unwrap();
+        assert_eq!(folders[0].unread_count, 2);
     }
 
     #[test]
@@ -405,19 +775,95 @@ mod tests {
         upsert_entry(&conn, f, "g2", "New", None, "<p>x</p>", Some("2026-02-01T00:00:00Z")).unwrap();
         upsert_entry(&conn, f, "g3", "Mid", None, "<p>x</p>", Some("2026-01-15T00:00:00Z")).unwrap();
 
-        let all = list_entries(&conn, "all", None).unwrap();
+        let all = list_entries(&conn, "all", EntryScope::All).unwrap();
         let titles: Vec<&str> = all.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, vec!["New", "Mid", "Old"]);
 
         set_read(&conn, all[0].id, true).unwrap();
-        let unread = list_entries(&conn, "unread", None).unwrap();
+        let unread = list_entries(&conn, "unread", EntryScope::All).unwrap();
         assert_eq!(unread.len(), 2);
         assert!(unread.iter().all(|e| !e.is_read));
 
-        let per_feed = list_entries(&conn, "all", Some(f)).unwrap();
+        let per_feed = list_entries(&conn, "all", EntryScope::Feed { id: f }).unwrap();
         assert_eq!(per_feed.len(), 3, "feed view includes read entries");
 
-        assert!(list_entries(&conn, "bogus", None).is_err());
+        assert!(list_entries(&conn, "bogus", EntryScope::All).is_err());
+    }
+
+    #[test]
+    fn list_entries_scopes_combine_with_views() {
+        let conn = open_memory().unwrap();
+        let tech = create_folder(&conn, "Tech").unwrap();
+        let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
+        let c = insert_or_update_feed(&conn, "https://c.example/feed", "C", None).unwrap();
+        move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
+        move_feed_to_folder(&conn, b, Some(tech.id)).unwrap();
+        // c stays uncategorized.
+        upsert_entry(&conn, a, "g1", "E1", None, "<p>x</p>", Some("2026-01-01T00:00:00Z")).unwrap();
+        upsert_entry(&conn, a, "g2", "E2", None, "<p>x</p>", Some("2026-01-02T00:00:00Z")).unwrap();
+        upsert_entry(&conn, b, "g3", "E4", None, "<p>x</p>", Some("2026-01-04T00:00:00Z")).unwrap();
+        upsert_entry(&conn, c, "g4", "E3", None, "<p>x</p>", Some("2026-01-03T00:00:00Z")).unwrap();
+
+        // e1 (feed a): starred + unread; e2: read; e4 (feed b): unread; e3 (feed c): starred + read.
+        set_starred(&conn, 1, true).unwrap();
+        set_starred(&conn, 4, true).unwrap();
+        set_read(&conn, 2, true).unwrap();
+        set_read(&conn, 4, true).unwrap();
+
+        let titles = |entries: Vec<EntryDto>| -> Vec<String> {
+            entries.into_iter().map(|e| e.title).collect()
+        };
+
+        assert_eq!(
+            titles(list_entries(&conn, "all", EntryScope::All).unwrap()),
+            vec!["E4", "E3", "E2", "E1"],
+            "newest first"
+        );
+        assert_eq!(
+            titles(list_entries(&conn, "all", EntryScope::Folder { id: tech.id }).unwrap()),
+            vec!["E4", "E2", "E1"],
+            "folder scope covers its feeds only"
+        );
+        assert_eq!(
+            titles(list_entries(&conn, "all", EntryScope::Feed { id: c }).unwrap()),
+            vec!["E3"],
+            "feed scope unchanged"
+        );
+        assert_eq!(
+            titles(list_entries(&conn, "all", EntryScope::Starred).unwrap()),
+            vec!["E3", "E1"],
+            "starred scope is global across feeds and folders"
+        );
+        assert_eq!(
+            titles(list_entries(&conn, "unread", EntryScope::Starred).unwrap()),
+            vec!["E1"],
+            "view combines with starred scope"
+        );
+        assert_eq!(
+            titles(list_entries(&conn, "unread", EntryScope::Folder { id: tech.id }).unwrap()),
+            vec!["E4", "E1"]
+        );
+    }
+
+    #[test]
+    fn set_starred_is_independent_of_read_state_and_persists() {
+        let conn = open_memory().unwrap();
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        upsert_entry(&conn, f, "g1", "T", None, "<p>x</p>", None).unwrap();
+
+        set_read(&conn, 1, true).unwrap();
+        set_starred(&conn, 1, true).unwrap();
+        let entry = &list_entries(&conn, "all", EntryScope::All).unwrap()[0];
+        assert!(entry.is_starred, "star persisted");
+        assert!(entry.is_read, "read state untouched by starring");
+
+        set_starred(&conn, 1, false).unwrap();
+        let entry = &list_entries(&conn, "all", EntryScope::All).unwrap()[0];
+        assert!(!entry.is_starred);
+        assert!(entry.is_read, "read state untouched by unstarring");
+
+        assert!(set_starred(&conn, 999, true).is_err(), "unknown entry rejected");
     }
 
     #[test]

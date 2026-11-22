@@ -10,6 +10,7 @@ defineProps<{
 
 const emit = defineEmits<{
   select: [entry: Entry];
+  toggleStar: [entry: Entry];
   refreshAll: [];
   setView: [view: "all" | "unread"];
 }>();
@@ -58,6 +59,14 @@ function fmtDate(iso: string | null): string {
       >
         <span class="entry-title">{{ entry.title }}</span>
         <span class="entry-date">{{ fmtDate(entry.published_at) }}</span>
+        <button
+          class="star"
+          :class="{ starred: entry.is_starred }"
+          :title="entry.is_starred ? 'Unstar' : 'Star'"
+          @click.stop="emit('toggleStar', entry)"
+        >
+          {{ entry.is_starred ? "\u2605" : "\u2606" }}
+        </button>
       </li>
       <li v-if="entries.length === 0" class="empty">No entries.</li>
     </ul>
@@ -142,6 +151,24 @@ function fmtDate(iso: string | null): string {
   color: #888;
   font-size: 0.8rem;
   flex-shrink: 0;
+}
+.star {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 0.1rem 0.2rem;
+  border-radius: 4px;
+  color: #999;
+  flex-shrink: 0;
+}
+.star:hover {
+  background: #eee;
+  color: #d4a017;
+}
+.star.starred {
+  color: #d4a017;
 }
 .empty {
   padding: 1rem 0.75rem;

@@ -256,7 +256,7 @@ mod tests {
         let guard = conn.lock().unwrap();
         assert_eq!(db::list_feeds(&guard).unwrap().len(), 0, "no feed rows created");
         assert_eq!(
-            db::list_entries(&guard, "all", None).unwrap().len(),
+            db::list_entries(&guard, "all", db::EntryScope::All).unwrap().len(),
             0,
             "no entries created"
         );
@@ -272,7 +272,7 @@ mod tests {
         assert!(matches!(second, AddFeedResult::Existing(_)));
         let guard = conn.lock().unwrap();
         assert_eq!(db::list_feeds(&guard).unwrap().len(), 1);
-        assert_eq!(db::list_entries(&guard, "all", None).unwrap().len(), 1);
+        assert_eq!(db::list_entries(&guard, "all", db::EntryScope::All).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -305,7 +305,7 @@ mod tests {
         assert!(good.last_error.is_none(), "good feed stored without error");
         assert!(good.last_fetched_at.is_some());
         assert!(bad.last_error.is_some(), "failed feed records its error");
-        let entries = db::list_entries(&guard, "all", None).unwrap();
+        let entries = db::list_entries(&guard, "all", db::EntryScope::All).unwrap();
         assert_eq!(entries.len(), 1, "good feed's entry stored despite sibling failure");
         assert_eq!(entries[0].feed_id, good_id);
     }
