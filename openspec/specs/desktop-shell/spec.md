@@ -26,8 +26,8 @@ The system SHALL expose at least one Rust command that the frontend can invoke, 
 
 #### Scenario: Round-trip IPC call succeeds
 
-- **WHEN** the frontend invokes the example Rust command with a name argument
-- **THEN** the Rust backend returns a greeting containing that name and the frontend displays it without console errors
+- **WHEN** the frontend invokes a reader Rust command (for example, listing feeds)
+- **THEN** the Rust backend returns data derived from the application state and the frontend renders it without console errors
 
 ### Requirement: App identity is configured
 
