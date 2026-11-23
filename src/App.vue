@@ -9,6 +9,8 @@ import {
   listFeeds,
   listFolders,
   listEntries,
+  countEntries,
+  getEntry,
   refreshAll,
   refreshFeed,
   refreshFolder,
@@ -16,8 +18,10 @@ import {
   setRead,
   setStarred,
   entryCounts,
+  type Cursor,
   type Entry,
   type EntryCounts,
+  type EntryListItem,
   type EntryScope,
   type EntryView,
   type Feed,
@@ -27,11 +31,26 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { message } from "@tauri-apps/plugin-dialog";
 
+/** Entries per batch. A constant: the app has no settings persistence, and
+ *  batch size is not worth adding one for. */
+const PAGE_SIZE = 50;
+
 const feeds = ref<Feed[]>([]);
 const folders = ref<Folder[]>([]);
-const entries = ref<Entry[]>([]);
+/** Everything loaded so far — grows one batch at a time, never all at once. */
+const entries = ref<EntryListItem[]>([]);
+/** Where the next batch continues from: null until the first batch lands. */
+const after = ref<Cursor | null>(null);
+const hasMore = ref(false);
+/** A further batch is in flight, so the scroll sentinel does not ask twice. */
+const loadingMore = ref(false);
+/** Entries matching the current view and scope, for the progress line. */
+const total = ref(0);
 const selection = ref<Selection>({ kind: "all" });
 const selectedEntryId = ref<number | null>(null);
+/** Loaded through `getEntry` rather than looked up in `entries`, so paging
+ *  away from the open entry does not close the reading pane. */
+const selectedEntry = ref<Entry | null>(null);
 const view = ref<EntryView>("all");
 const counts = ref<EntryCounts>({ all_entries: 0, starred_entries: 0 });
 const busy = ref(false);
@@ -50,20 +69,23 @@ function startEdit(feed: Feed) {
   editingFeed.value = feed;
 }
 
-const selectedEntry = computed(
-  () => entries.value.find((e) => e.id === selectedEntryId.value) ?? null,
-);
-// The reading pane names the entry's own feed, so it works in every view.
 const selectedFeed = computed(() => {
   const entry = selectedEntry.value;
   if (!entry) return null;
   return feeds.value.find((f) => f.id === entry.feed_id) ?? null;
 });
 
-/** Tab shown in the entry list: the starred view is always on "All". */
-const displayView = computed<EntryView>(() =>
-  selection.value.kind === "starred" ? "all" : view.value,
-);
+/** The view the list is actually showing: tabs only apply to the global
+ *  views, and the starred view never has an unread filter. */
+function activeView(): EntryView {
+  if (selection.value.kind === "starred") return "all";
+  return isGlobal(selection.value) ? view.value : "all";
+}
+
+const displayView = computed<EntryView>(() => activeView());
+
+/** Rows the reader has loaded so far. */
+const viewedCount = computed(() => entries.value.length);
 
 function scopeOf(sel: Selection): EntryScope {
   switch (sel.kind) {
@@ -93,6 +115,48 @@ async function refreshCounts() {
   counts.value = global;
 }
 
+/** Ask the backend for rows starting at `start`, newest first. */
+async function fetchRows(
+  start: Cursor | null,
+  limit: number,
+): Promise<EntryListItem[]> {
+  return listEntries(activeView(), scopeOf(selection.value), start, limit);
+}
+
+function cursorOfLast(rows: EntryListItem[]): Cursor | null {
+  const last = rows[rows.length - 1];
+  return last ? { sort: last.sort_key, id: last.id } : null;
+}
+
+/** Bumped whenever the list is reset. In-flight responses from the previous
+ *  selection are discarded instead of appended — otherwise a fast scope
+ *  change would leave rows from the old selection in the new list. */
+let generation = 0;
+
+/** Read the rows the reader has loaded, from the newest row down, in one
+ *  round trip. Rows are body-free, so even a deep load stays cheap. */
+async function fetchWindow(depth: number): Promise<void> {
+  const gen = generation;
+  const rows = await fetchRows(null, depth);
+  if (gen !== generation) return;
+  const items = rows.slice(0, depth);
+  entries.value = items;
+  // One row beyond the window: `hasMore` then costs no extra COUNT.
+  hasMore.value = rows.length > depth;
+  after.value = cursorOfLast(items);
+  total.value = await countEntries(activeView(), scopeOf(selection.value));
+}
+
+/** Load the first batch and clear everything else. */
+async function loadFirstBatch(): Promise<void> {
+  entries.value = [];
+  after.value = null;
+  hasMore.value = false;
+  await fetchWindow(PAGE_SIZE);
+}
+
+/** Load the current window in place. Every refresh path calls this, so a
+ *  refresh can never move the reader off what they had loaded. */
 async function reload() {
   try {
     await refreshCounts();
@@ -101,33 +165,57 @@ async function reload() {
     if (sel.kind === "folder" && !folders.value.some((f) => f.id === sel.id)) {
       selection.value = { kind: "all" };
     }
-    // The starred view always lists every starred entry; the all/unread
-    // tabs apply to "All entries" only. Feed and folder selections always
-    // show that scope's full list (pre-existing behavior).
-    const activeView: EntryView =
-      selection.value.kind === "starred"
-        ? "all"
-        : isGlobal(selection.value)
-          ? view.value
-          : "all";
-    entries.value = await listEntries(activeView, scopeOf(selection.value));
-    loadError.value = null;
-    // Keep the open entry if it still exists; otherwise clear the pane.
-    if (
-      selectedEntryId.value !== null &&
-      !entries.value.some((e) => e.id === selectedEntryId.value)
-    ) {
-      selectedEntryId.value = null;
+    if (entries.value.length === 0) {
+      await loadFirstBatch();
+    } else {
+      await fetchWindow(Math.max(entries.value.length, PAGE_SIZE));
     }
+    loadError.value = null;
   } catch (e) {
     loadError.value = String(e);
+  }
+}
+
+/** Any change of view or scope starts over from the newest batch. */
+function startOver() {
+  generation += 1;
+  entries.value = [];
+  after.value = null;
+  hasMore.value = false;
+  void reload();
+}
+
+/** Append the next batch. The scroll sentinel asks; this decides. */
+async function loadMore() {
+  if (!hasMore.value || loadingMore.value || entries.value.length === 0) return;
+  const gen = generation;
+  loadingMore.value = true;
+  try {
+    const rows = await fetchRows(after.value, PAGE_SIZE);
+    // The reader changed scope or view while this batch was in flight.
+    if (gen !== generation) return;
+    const items = rows.slice(0, PAGE_SIZE);
+    if (items.length === 0) {
+      // Everything after the cursor was deleted: stop rather than spin.
+      hasMore.value = false;
+    } else {
+      entries.value.push(...items);
+      after.value = cursorOfLast(items);
+      hasMore.value = rows.length > PAGE_SIZE;
+    }
+    loadError.value = null;
+  } catch (e) {
+    loadError.value = String(e);
+  } finally {
+    loadingMore.value = false;
   }
 }
 
 function select(sel: Selection) {
   selection.value = sel;
   selectedEntryId.value = null;
-  void reload();
+  selectedEntry.value = null;
+  startOver();
 }
 
 function setView(v: EntryView) {
@@ -140,20 +228,44 @@ function setView(v: EntryView) {
   if (!isGlobal(selection.value)) {
     selection.value = { kind: "all" };
   }
-  void reload();
+  startOver();
 }
 
-function selectEntry(entry: Entry) {
-  selectedEntryId.value = entry.id;
-  if (!entry.is_read) {
-    void applyRead(entry, true);
+async function selectEntry(item: EntryListItem) {
+  selectedEntryId.value = item.id;
+  // Never leave the previous article on screen under a new title.
+  selectedEntry.value = null;
+  try {
+    const full = await getEntry(item.id);
+    // A newer selection, or a cleared pane, already moved on.
+    if (selectedEntryId.value !== item.id) return;
+    selectedEntry.value = full;
+    if (full === null) {
+      // The entry is gone (its feed was removed).
+      selectedEntryId.value = null;
+      return;
+    }
+    if (!full.is_read) await applyRead(full, true);
+  } catch (e) {
+    loadError.value = String(e);
   }
+}
+
+/** The list row and the open entry are two separate objects after pagination;
+ *  every state change goes through here so the two cannot drift apart. */
+function patchEntry(
+  id: number,
+  patch: { is_read?: boolean; is_starred?: boolean },
+) {
+  const row = entries.value.find((e) => e.id === id);
+  if (row) Object.assign(row, patch);
+  if (selectedEntry.value?.id === id) Object.assign(selectedEntry.value, patch);
 }
 
 async function applyRead(entry: Entry, isRead: boolean) {
   try {
     await setRead(entry.id, isRead);
-    entry.is_read = isRead;
+    patchEntry(entry.id, { is_read: isRead });
     // Refresh counts in the sidebar without resetting selection.
     await refreshCounts();
   } catch (e) {
@@ -166,21 +278,15 @@ function toggleRead() {
   if (entry) void applyRead(entry, !entry.is_read);
 }
 
-async function toggleStar(entry: Entry) {
+async function toggleStar(entry: EntryListItem) {
   try {
     const next = !entry.is_starred;
     await setStarred(entry.id, next);
-    entry.is_starred = next;
-    // Leaving the starred view must drop the entry from its list.
-    // The starred scope always lists every starred entry (no unread filter).
+    patchEntry(entry.id, { is_starred: next });
+    // Leaving the starred view must drop the entry from its list. The page
+    // itself stays put.
     if (selection.value.kind === "starred") {
-      entries.value = await listEntries("all", { kind: "starred" });
-      if (
-        selectedEntryId.value !== null &&
-        !entries.value.some((e) => e.id === selectedEntryId.value)
-      ) {
-        selectedEntryId.value = null;
-      }
+      await reload();
     }
     // Starring changes the Starred badge, so counts refresh here too.
     await refreshCounts();
@@ -241,6 +347,11 @@ async function doRemove(feedId: number) {
       selection.value = { kind: "all" };
       selectedEntryId.value = null;
     }
+    // Removing a feed cascades to its entries, so the open entry is gone too.
+    if (selectedEntry.value?.feed_id === feedId) {
+      selectedEntry.value = null;
+      selectedEntryId.value = null;
+    }
     await reload();
   } catch (e) {
     loadError.value = String(e);
@@ -282,10 +393,15 @@ onMounted(reload);
       :view="displayView"
       :unread-filter-available="selection.kind !== 'starred'"
       :busy="busy"
+      :viewed-count="viewedCount"
+      :total="total"
+      :has-more="hasMore"
+      :loading-more="loadingMore"
       @select="selectEntry"
       @toggle-star="toggleStar"
       @refresh-all="doRefreshAll"
       @set-view="setView"
+      @load-more="loadMore"
     />
     <ReadingPane
       :entry="selectedEntry"

@@ -31,12 +31,12 @@ Starring SHALL NOT change an entry's read state, and marking an entry read or un
 
 ### Requirement: Global starred view
 
-The system SHALL provide a global "Starred" view in the sidebar that lists all starred entries newest first, regardless of which feed or folder they belong to. Selecting a feed or folder SHALL switch away from the starred view; the starred view SHALL NOT be combined with a feed or folder selection.
+The system SHALL provide a global "Starred" view in the sidebar that makes all starred entries reachable newest first, regardless of which feed or folder they belong to. Selecting a feed or folder SHALL switch away from the starred view; the starred view SHALL NOT be combined with a feed or folder selection.
 
 #### Scenario: Viewing starred entries
 
 - **WHEN** the user selects the Starred view
-- **THEN** every starred entry from any feed is listed newest first
+- **THEN** starred entries from any feed are listed newest first, and the remaining starred entries are reachable by loading further batches
 
 #### Scenario: Starred view is global
 
@@ -50,12 +50,12 @@ The system SHALL provide a global "Starred" view in the sidebar that lists all s
 
 ### Requirement: Starred view always shows all starred entries
 
-The system SHALL list every starred entry — read or unread — whenever the Starred view is selected, and SHALL NOT offer the unread filter while the Starred view is selected. The unread filter state used by "All entries" SHALL be unaffected by visiting the Starred view.
+The system SHALL make every starred entry — read or unread — reachable whenever the Starred view is selected, and SHALL NOT offer the unread filter while the Starred view is selected. The unread filter state used by "All entries" SHALL be unaffected by visiting the Starred view.
 
 #### Scenario: Selecting Starred from the unread list
 
 - **WHEN** the user is viewing the Unread tab of "All entries" and selects the Starred view
-- **THEN** all starred entries from any feed are listed newest first with the All tab active
+- **THEN** starred entries from any feed are listed newest first with the All tab active, and every starred entry remains reachable by loading further batches
 
 #### Scenario: Unread filter is not offered in the Starred view
 
@@ -71,6 +71,11 @@ The system SHALL list every starred entry — read or unread — whenever the St
 
 - **WHEN** the user selects "All entries" and then the Unread tab
 - **THEN** only unread entries are listed, newest first
+
+#### Scenario: Scrolling through starred entries
+
+- **WHEN** the user has starred more entries than fit on one batch and reaches the end of the loaded rows
+- **THEN** further starred entries are loaded and appended, read and unread alike, with no unread filter applied
 
 ### Requirement: Sidebar shows the starred entry count
 

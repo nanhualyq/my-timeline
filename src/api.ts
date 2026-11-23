@@ -30,6 +30,34 @@ export interface Entry {
   is_starred: boolean;
 }
 
+/**
+ * One row of the paginated entry list. Deliberately carries no
+ * `content_html`: the list renders a title and a date, and bodies are fetched
+ * on demand for the entry being read.
+ */
+export interface EntryListItem {
+  id: number;
+  feed_id: number;
+  title: string;
+  link: string | null;
+  published_at: string | null;
+  /** Ordering position — publication time when known, arrival time otherwise.
+   * Echoed back as the cursor for the next page. */
+  sort_key: string;
+  is_read: boolean;
+  is_starred: boolean;
+}
+
+/**
+ * Keyset cursor: the ordering position and id of the last row of the previous
+ * page. Preferred over an offset so a refresh cannot shift the page the reader
+ * is on.
+ */
+export interface Cursor {
+  sort: string;
+  id: number;
+}
+
 export interface RefreshOutcome {
   feed_id: number;
   error: string | null;
@@ -67,8 +95,26 @@ export function listFolders(): Promise<Folder[]> {
   return invoke<Folder[]>("list_folders");
 }
 
-export function listEntries(view: EntryView, scope: EntryScope): Promise<Entry[]> {
-  return invoke<Entry[]>("list_entries", { view, scope });
+export function listEntries(
+  view: EntryView,
+  scope: EntryScope,
+  after: Cursor | null,
+  limit: number,
+): Promise<EntryListItem[]> {
+  return invoke<EntryListItem[]>("list_entries", { view, scope, after, limit });
+}
+
+/** How many entries match a view and scope, for the list's progress total. */
+export function countEntries(
+  view: EntryView,
+  scope: EntryScope,
+): Promise<number> {
+  return invoke<number>("count_entries", { view, scope });
+}
+
+/** One entry with its content, for the reading pane. Null when it is gone. */
+export function getEntry(entryId: number): Promise<Entry | null> {
+  return invoke<Entry | null>("get_entry", { entryId });
 }
 
 export function setRead(entryId: number, isRead: boolean): Promise<void> {

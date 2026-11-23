@@ -23,10 +23,32 @@ fn list_entries(
     app: tauri::AppHandle,
     view: String,
     scope: db::EntryScope,
-) -> Result<Vec<db::EntryDto>, String> {
+    after: Option<db::EntryCursor>,
+    limit: i64,
+) -> Result<Vec<db::EntryListItemDto>, String> {
     let conn = shared_conn(&app)?;
     let guard = conn.lock().map_err(|e| e.to_string())?;
-    db::list_entries(&guard, &view, scope)
+    db::list_entries(&guard, &view, scope, after.as_ref(), limit)
+}
+
+/// Entries matching a view and scope, for the list's progress total.
+#[tauri::command]
+fn count_entries(
+    app: tauri::AppHandle,
+    view: String,
+    scope: db::EntryScope,
+) -> Result<i64, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::count_entries(&guard, &view, scope)
+}
+
+/// One entry with its content, for the reading pane.
+#[tauri::command]
+fn get_entry(app: tauri::AppHandle, entry_id: i64) -> Result<Option<db::EntryDto>, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::get_entry(&guard, entry_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -207,6 +229,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_feeds,
             list_entries,
+            count_entries,
+            get_entry,
             list_folders,
             entry_counts,
             create_folder,

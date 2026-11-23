@@ -265,7 +265,7 @@ mod tests {
 
         // Import only stores records — no entries exist until a manual refresh.
         assert_eq!(
-            db::list_entries(&conn, "all", db::EntryScope::All).unwrap().len(),
+            db::list_all_entries(&conn, "all", db::EntryScope::All).unwrap().len(),
             0
         );
     }

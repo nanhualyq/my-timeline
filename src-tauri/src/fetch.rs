@@ -160,7 +160,7 @@ pub fn looks_like_feed(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{open_memory, list_entries, EntryScope};
+    use crate::db::{open_memory, list_all_entries, EntryScope};
 
     const FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -213,7 +213,7 @@ mod tests {
         let id = store_feed(&conn, "https://fixture.example/rss", &parsed).unwrap();
         store_feed(&conn, "https://fixture.example/rss", &parsed).unwrap();
 
-        let entries = list_entries(&conn, "all", EntryScope::All).unwrap();
+        let entries = list_all_entries(&conn, "all", EntryScope::All).unwrap();
         assert_eq!(entries.len(), 2, "re-storing the same feed must not duplicate");
         let feeds = db::list_feeds(&conn).unwrap();
         assert_eq!(feeds.len(), 1);

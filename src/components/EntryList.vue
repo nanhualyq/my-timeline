@@ -1,21 +1,69 @@
 <script setup lang="ts">
-import type { Entry } from "../api";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import type { EntryListItem } from "../api";
 
-defineProps<{
-  entries: Entry[];
+const props = defineProps<{
+  entries: EntryListItem[];
   selectedEntryId: number | null;
   view: "all" | "unread";
   busy: boolean;
   /** False while the Starred view is selected: that view has no unread filter. */
   unreadFilterAvailable: boolean;
+  /** Rows loaded so far, for the progress line. */
+  viewedCount: number;
+  /** Entries matching the current view and scope — not a global total. */
+  total: number;
+  /** Another batch exists beyond the loaded rows. */
+  hasMore: boolean;
+  /** A further batch is in flight. */
+  loadingMore: boolean;
 }>();
 
 const emit = defineEmits<{
-  select: [entry: Entry];
-  toggleStar: [entry: Entry];
+  select: [entry: EntryListItem];
+  toggleStar: [entry: EntryListItem];
   refreshAll: [];
   setView: [view: "all" | "unread"];
+  loadMore: [];
 }>();
+
+/** The scrolling list and the row at its end that asks for another batch. */
+const listEl = ref<HTMLElement | null>(null);
+const sentinel = ref<HTMLElement | null>(null);
+let observer: IntersectionObserver | null = null;
+
+function sentinelVisible(): boolean {
+  const row = sentinel.value?.getBoundingClientRect();
+  const box = listEl.value?.getBoundingClientRect();
+  if (!row || !box) return false;
+  return row.top <= box.bottom && row.bottom >= box.top;
+}
+
+onMounted(() => {
+  if (!listEl.value) return;
+  observer = new IntersectionObserver(
+    (records) => {
+      if (records.some((r) => r.isIntersecting) && props.hasMore) {
+        emit("loadMore");
+      }
+    },
+    // Start loading slightly before the reader reaches the end.
+    { root: listEl.value, rootMargin: "150px 0px" },
+  );
+  if (sentinel.value) observer.observe(sentinel.value);
+});
+
+// An observer only reports crossings, so after a batch lands it would stay
+// silent while the sentinel is still on screen. Ask again instead of
+// stalling — the list keeps growing until the sentinel scrolls away.
+watch(
+  () => props.loadingMore,
+  (loading) => {
+    if (!loading && props.hasMore && sentinelVisible()) emit("loadMore");
+  },
+);
+
+onBeforeUnmount(() => observer?.disconnect());
 
 function fmtDate(iso: string | null): string {
   if (!iso) return "";
@@ -52,7 +100,7 @@ function fmtDate(iso: string | null): string {
       </button>
     </header>
 
-    <ul class="entries">
+    <ul ref="listEl" class="entries">
       <li
         v-for="entry in entries"
         :key="entry.id"
@@ -72,7 +120,23 @@ function fmtDate(iso: string | null): string {
         </button>
       </li>
       <li v-if="entries.length === 0" class="empty">No entries.</li>
+      <!-- Always mounted so the observer wiring never has to be rebuilt;
+           hidden only while there is nothing to scroll through. -->
+      <li
+        ref="sentinel"
+        class="sentinel"
+        :class="{ hidden: entries.length === 0 }"
+        aria-live="polite"
+      >
+        <span v-if="loadingMore">Loading…</span>
+        <span v-else-if="hasMore">Scroll for more</span>
+        <span v-else>End of list</span>
+      </li>
     </ul>
+
+    <footer class="list-footer">
+      <span class="progress">{{ viewedCount }} / {{ total }} entries viewed</span>
+    </footer>
   </section>
 </template>
 
@@ -182,5 +246,26 @@ function fmtDate(iso: string | null): string {
   padding: 1rem 0.75rem;
   color: #888;
   font-style: italic;
+}
+.sentinel {
+  padding: 0.6rem 0.75rem;
+  text-align: center;
+  color: #888;
+  font-size: 0.78rem;
+  font-style: italic;
+}
+.sentinel.hidden {
+  display: none;
+}
+.list-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  border-top: 1px solid #ddd;
+  font-size: 0.78rem;
+  color: #666;
+  flex-shrink: 0;
 }
 </style>

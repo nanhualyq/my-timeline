@@ -42,11 +42,19 @@ const COLUMN_MIGRATIONS: &[&str] = &[
     "ALTER TABLE feeds ADD COLUMN folder_id INTEGER REFERENCES folders(id)",
     "ALTER TABLE entries ADD COLUMN is_starred INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE feeds ADD COLUMN custom_title TEXT",
+    // Arrival time. Needed for a total ordering: `published_at` is nullable,
+    // and keyset paging cannot compare against NULL.
+    "ALTER TABLE entries ADD COLUMN created_at TEXT",
 ];
 
 /// Indexes that depend on migrated columns.
 const POST_MIGRATION: &str = "
 CREATE INDEX IF NOT EXISTS idx_entries_starred ON entries(is_starred, published_at DESC);
+-- Ordering position for every paginated query. Must be an expression index
+-- because the key coalesces two columns; the query text has to match it
+-- verbatim to be usable.
+CREATE INDEX IF NOT EXISTS idx_entries_sort
+  ON entries(COALESCE(published_at, created_at) DESC, id DESC);
 ";
 
 /// Create the schema in an already-open connection. Safe to call on every open:
@@ -61,6 +69,12 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             Err(e) => return Err(e),
         }
     }
+    // Arrival time for entries stored before the column existed. This only
+    // ever fills rows that still have none, so it is safe to run on every open.
+    conn.execute(
+        "UPDATE entries SET created_at = datetime('now') WHERE created_at IS NULL",
+        [],
+    )?;
     conn.execute_batch(POST_MIGRATION)
 }
 
@@ -149,6 +163,9 @@ pub fn insert_or_update_feed(
 
 /// Insert an entry, or update the existing one for the same (feed, guid).
 /// `guid` must be non-empty; callers pass the link when the feed omits a GUID.
+/// The arrival time (`created_at`) is set once on insert and never updated:
+/// keyset paging treats it as immutable, so re-fetching a feed must not move
+/// an entry's position.
 pub fn upsert_entry(
     conn: &Connection,
     feed_id: i64,
@@ -159,8 +176,8 @@ pub fn upsert_entry(
     published_at: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO entries (feed_id, guid, title, link, content_html, published_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO entries (feed_id, guid, title, link, content_html, published_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
          ON CONFLICT(feed_id, guid) DO UPDATE SET
            title = excluded.title,
            link = excluded.link,
@@ -194,49 +211,156 @@ pub fn list_feeds(conn: &Connection) -> Result<Vec<FeedDto>, rusqlite::Error> {
     rows.collect()
 }
 
-/// List entries for a scope combined with a view (`"all"` or `"unread"`).
-/// Newest first. The starred scope is independent of feed/folder selection.
+/// Ordering position of an entry: publication time when one is known, arrival
+/// time otherwise. The expression must match `idx_entries_sort` verbatim or
+/// SQLite cannot use that index for the global ordering.
+const SORT_KEY: &str = "COALESCE(published_at, created_at)";
+
+/// Page cursor: the ordering position and id of the last row of the previous
+/// page. Keyset rather than an offset, so refreshing feeds cannot shift the
+/// page the reader is currently on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EntryCursor {
+    /// `SORT_KEY` for the boundary row — never NULL, which is the whole point
+    /// of coalescing the publication time with the arrival time.
+    pub sort: String,
+    pub id: i64,
+}
+
+/// One row of a paginated entry list. Carries no `content_html`: the list
+/// only renders a title and a date, and bodies are fetched on demand for the
+/// entry being read. `sort_key` is echoed back by the frontend as the cursor
+/// for the following page.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryListItemDto {
+    pub id: i64,
+    pub feed_id: i64,
+    pub title: String,
+    pub link: Option<String>,
+    pub published_at: Option<String>,
+    pub sort_key: String,
+    pub is_read: bool,
+    pub is_starred: bool,
+}
+
+type Param = Box<dyn rusqlite::ToSql>;
+
+/// WHERE conditions (without the keyword) and their bound parameters for a
+/// view/scope pair. Shared by listing and counting so the two can never
+/// disagree about which entries belong to a view.
+fn filter_conditions(view: &str, scope: EntryScope) -> Result<(Vec<String>, Vec<Param>), String> {
+    if view != "all" && view != "unread" {
+        return Err(format!("unknown view: {view}"));
+    }
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<Param> = Vec::new();
+    match scope {
+        EntryScope::All => {}
+        EntryScope::Feed { id } => {
+            conditions.push("feed_id = ?".to_string());
+            params.push(Box::new(id));
+        }
+        EntryScope::Folder { id } => {
+            conditions.push("feed_id IN (SELECT id FROM feeds WHERE folder_id = ?)".to_string());
+            params.push(Box::new(id));
+        }
+        EntryScope::Starred => conditions.push("is_starred = 1".to_string()),
+    }
+    if view == "unread" {
+        conditions.push("is_read = 0".to_string());
+    }
+    Ok((conditions, params))
+}
+
+fn where_clause(conditions: &[String]) -> String {
+    if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    }
+}
+
+fn bind_refs(params: &[Param]) -> Vec<&dyn rusqlite::ToSql> {
+    params.iter().map(|p| p.as_ref()).collect()
+}
+
+/// One page of entries for a scope combined with a view (`"all"` or
+/// `"unread"`), newest first: at most `limit` rows strictly older than
+/// `after`, where `after: None` starts at the newest page.
+///
+/// The query actually asks for `limit + 1` rows — receiving more than `limit`
+/// is how callers learn that another page exists, without a second query.
+/// Callers MUST slice to `limit`.
 pub fn list_entries(
     conn: &Connection,
     view: &str,
     scope: EntryScope,
-) -> Result<Vec<EntryDto>, String> {
-    if view != "all" && view != "unread" {
-        return Err(format!("unknown view: {view}"));
+    after: Option<&EntryCursor>,
+    limit: i64,
+) -> Result<Vec<EntryListItemDto>, String> {
+    let (mut conditions, mut params) = filter_conditions(view, scope)?;
+    if let Some(cursor) = after {
+        conditions.push(format!("({key} < ? OR ({key} = ? AND id < ?))", key = SORT_KEY));
+        params.push(Box::new(cursor.sort.clone()));
+        params.push(Box::new(cursor.sort.clone()));
+        params.push(Box::new(cursor.id));
     }
-    let mut conditions: Vec<&str> = Vec::new();
-    let mut id_params: Vec<i64> = Vec::new();
-    match scope {
-        EntryScope::All => {}
-        EntryScope::Feed { id } => {
-            conditions.push("feed_id = ?");
-            id_params.push(id);
-        }
-        EntryScope::Folder { id } => {
-            conditions.push("feed_id IN (SELECT id FROM feeds WHERE folder_id = ?)");
-            id_params.push(id);
-        }
-        EntryScope::Starred => conditions.push("is_starred = 1"),
-    }
-    if view == "unread" {
-        conditions.push("is_read = 0");
-    }
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
+    params.push(Box::new(limit.max(0) + 1));
     let sql = format!(
-        "SELECT id, feed_id, title, link, content_html, published_at, is_read, is_starred
-         FROM entries {where_clause} ORDER BY published_at DESC, id DESC"
+        "SELECT id, feed_id, title, link, published_at, {key} AS sort_key, is_read, is_starred
+         FROM entries {where}
+         ORDER BY {key} DESC, id DESC
+         LIMIT ?",
+        key = SORT_KEY,
+        where = where_clause(&conditions),
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> =
-        id_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-    stmt.query_map(param_refs.as_slice(), map_entry)
+    let refs = bind_refs(&params);
+    stmt.query_map(refs.as_slice(), map_list_item)
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+}
+
+fn map_list_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntryListItemDto> {
+    let is_read: i64 = r.get(6)?;
+    let is_starred: i64 = r.get(7)?;
+    Ok(EntryListItemDto {
+        id: r.get(0)?,
+        feed_id: r.get(1)?,
+        title: r.get(2)?,
+        link: r.get(3)?,
+        published_at: r.get(4)?,
+        sort_key: r.get(5)?,
+        is_read: is_read != 0,
+        is_starred: is_starred != 0,
+    })
+}
+
+/// How many entries match a view and scope. Separate from `list_entries`
+/// because the sidebar's global badge must not be reused for a filtered view.
+pub fn count_entries(conn: &Connection, view: &str, scope: EntryScope) -> Result<i64, String> {
+    let (conditions, params) = filter_conditions(view, scope)?;
+    let sql = format!("SELECT COUNT(*) FROM entries {}", where_clause(&conditions));
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let refs = bind_refs(&params);
+    stmt.query_row(refs.as_slice(), |r| r.get(0))
+        .map_err(|e| e.to_string())
+}
+
+/// One entry with its content, for the reading pane. `None` when the entry
+/// no longer exists (its feed was removed).
+pub fn get_entry(
+    conn: &Connection,
+    entry_id: i64,
+) -> Result<Option<EntryDto>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT id, feed_id, title, link, content_html, published_at, is_read, is_starred
+         FROM entries WHERE id = ?1",
+        params![entry_id],
+        map_entry,
+    )
+    .optional()
 }
 
 fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntryDto> {
@@ -252,6 +376,19 @@ fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntryDto> {
         is_read: is_read != 0,
         is_starred: is_starred != 0,
     })
+}
+
+/// Test helper: every row matching a view and scope, ignoring paging. Keeps
+/// existing assertions readable while the real API is page-bounded.
+#[cfg(test)]
+pub fn list_all_entries(
+    conn: &Connection,
+    view: &str,
+    scope: EntryScope,
+) -> Result<Vec<EntryListItemDto>, String> {
+    let total = count_entries(conn, view, scope)?;
+    let rows = list_entries(conn, view, scope, None, total)?;
+    Ok(rows.into_iter().take(total as usize).collect())
 }
 
 pub fn set_read(
@@ -616,6 +753,7 @@ mod tests {
             rows
         };
         assert!(entry_cols.contains(&"is_starred".to_string()));
+        assert!(entry_cols.contains(&"created_at".to_string()));
     }
 
     #[test]
@@ -637,6 +775,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(starred, 1);
+
+        let created_at: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name='created_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_at, 1);
+    }
+
+    #[test]
+    fn init_schema_backfills_created_at_for_entries_stored_before_it() {
+        // Simulate a pre-upgrade database holding entries, with no created_at.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(FOLDERS_TABLE).unwrap();
+        conn.execute(
+            "INSERT INTO feeds (url, title) VALUES ('https://a.example/feed', 'A')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO entries (feed_id, guid, title, content_html) VALUES (1, 'g1', 'T', '<p>x</p>')",
+            [],
+        ).unwrap();
+
+        // Two upgrade passes: the column is added, backfilled, and both pass.
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+
+        let created: String = conn
+            .query_row("SELECT created_at FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert!(!created.is_empty(), "legacy entry must gain an arrival time");
+    }
+
+    #[test]
+    fn init_schema_creates_the_sort_index_exactly_once() {
+        let conn = open_memory().unwrap();
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_entries_sort'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "repeated initialization must not duplicate the index");
+
+        // The index expression must match the query expression verbatim,
+        // otherwise SQLite cannot use it for the global ordering.
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_entries_sort'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("COALESCE(published_at, created_at)"),
+            "index must key on the ordering expression, got: {sql}"
+        );
     }
 
     #[test]
@@ -804,6 +1007,31 @@ mod tests {
     }
 
     #[test]
+    fn refetching_an_entry_preserves_its_arrival_time() {
+        let conn = open_memory().unwrap();
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+
+        upsert_entry(&conn, f, "g1", "v1", None, "<p>one</p>", Some("2026-01-01T00:00:00Z")).unwrap();
+        let initial: String = conn
+            .query_row("SELECT created_at FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert!(!initial.is_empty(), "a new entry records its arrival time");
+
+        // Pin it so the assertion does not depend on clock resolution.
+        conn.execute("UPDATE entries SET created_at = '2020-01-01 00:00:00'", [])
+            .unwrap();
+        upsert_entry(&conn, f, "g1", "v2", None, "<p>two</p>", Some("2026-01-02T00:00:00Z")).unwrap();
+
+        let (created, title): (String, String) = conn
+            .query_row("SELECT created_at, title FROM entries", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(created, "2020-01-01 00:00:00", "re-fetch must not move an entry's position");
+        assert_eq!(title, "v2", "the entry still updates in place");
+    }
+
+    #[test]
     fn same_guid_in_different_feeds_is_allowed() {
         let conn = open_memory().unwrap();
         let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
@@ -844,19 +1072,19 @@ mod tests {
         upsert_entry(&conn, f, "g2", "New", None, "<p>x</p>", Some("2026-02-01T00:00:00Z")).unwrap();
         upsert_entry(&conn, f, "g3", "Mid", None, "<p>x</p>", Some("2026-01-15T00:00:00Z")).unwrap();
 
-        let all = list_entries(&conn, "all", EntryScope::All).unwrap();
+        let all = list_all_entries(&conn, "all", EntryScope::All).unwrap();
         let titles: Vec<&str> = all.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, vec!["New", "Mid", "Old"]);
 
         set_read(&conn, all[0].id, true).unwrap();
-        let unread = list_entries(&conn, "unread", EntryScope::All).unwrap();
+        let unread = list_all_entries(&conn, "unread", EntryScope::All).unwrap();
         assert_eq!(unread.len(), 2);
         assert!(unread.iter().all(|e| !e.is_read));
 
-        let per_feed = list_entries(&conn, "all", EntryScope::Feed { id: f }).unwrap();
+        let per_feed = list_all_entries(&conn, "all", EntryScope::Feed { id: f }).unwrap();
         assert_eq!(per_feed.len(), 3, "feed view includes read entries");
 
-        assert!(list_entries(&conn, "bogus", EntryScope::All).is_err());
+        assert!(list_all_entries(&conn, "bogus", EntryScope::All).is_err());
     }
 
     #[test]
@@ -880,39 +1108,208 @@ mod tests {
         set_read(&conn, 2, true).unwrap();
         set_read(&conn, 4, true).unwrap();
 
-        let titles = |entries: Vec<EntryDto>| -> Vec<String> {
+        let titles = |entries: Vec<EntryListItemDto>| -> Vec<String> {
             entries.into_iter().map(|e| e.title).collect()
         };
 
         assert_eq!(
-            titles(list_entries(&conn, "all", EntryScope::All).unwrap()),
+            titles(list_all_entries(&conn, "all", EntryScope::All).unwrap()),
             vec!["E4", "E3", "E2", "E1"],
             "newest first"
         );
         assert_eq!(
-            titles(list_entries(&conn, "all", EntryScope::Folder { id: tech.id }).unwrap()),
+            titles(list_all_entries(&conn, "all", EntryScope::Folder { id: tech.id }).unwrap()),
             vec!["E4", "E2", "E1"],
             "folder scope covers its feeds only"
         );
         assert_eq!(
-            titles(list_entries(&conn, "all", EntryScope::Feed { id: c }).unwrap()),
+            titles(list_all_entries(&conn, "all", EntryScope::Feed { id: c }).unwrap()),
             vec!["E3"],
             "feed scope unchanged"
         );
         assert_eq!(
-            titles(list_entries(&conn, "all", EntryScope::Starred).unwrap()),
+            titles(list_all_entries(&conn, "all", EntryScope::Starred).unwrap()),
             vec!["E3", "E1"],
             "starred scope is global across feeds and folders"
         );
         assert_eq!(
-            titles(list_entries(&conn, "unread", EntryScope::Starred).unwrap()),
+            titles(list_all_entries(&conn, "unread", EntryScope::Starred).unwrap()),
             vec!["E1"],
             "view combines with starred scope"
         );
         assert_eq!(
-            titles(list_entries(&conn, "unread", EntryScope::Folder { id: tech.id }).unwrap()),
+            titles(list_all_entries(&conn, "unread", EntryScope::Folder { id: tech.id }).unwrap()),
             vec!["E4", "E1"]
         );
+    }
+
+    /// Mirrors the frontend: ask the database for `limit` rows, slice off the
+    /// probe row, and report whether another page exists.
+    fn page(
+        conn: &Connection,
+        view: &str,
+        scope: EntryScope,
+        after: Option<&EntryCursor>,
+        limit: i64,
+    ) -> (Vec<EntryListItemDto>, bool) {
+        let rows = list_entries(conn, view, scope, after, limit).unwrap();
+        let has_more = rows.len() as i64 > limit;
+        (
+            rows.into_iter().take(limit.max(0) as usize).collect(),
+            has_more,
+        )
+    }
+
+    fn cursor_of(row: &EntryListItemDto) -> EntryCursor {
+        EntryCursor {
+            sort: row.sort_key.clone(),
+            id: row.id,
+        }
+    }
+
+    #[test]
+    fn undated_entries_order_by_arrival_and_stay_reachable() {
+        let conn = open_memory().unwrap();
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        upsert_entry(&conn, f, "g1", "Dated 2019", None, "<p>x</p>", Some("2019-05-01T00:00:00+00:00")).unwrap();
+        upsert_entry(&conn, f, "g2", "Undated", None, "<p>x</p>", None).unwrap();
+        // Deterministic arrival time, newer than the dated entry's publication.
+        conn.execute(
+            "UPDATE entries SET created_at = '2026-06-01 12:00:00' WHERE guid = 'g2'",
+            [],
+        )
+        .unwrap();
+
+        let (page1, more) = page(&conn, "all", EntryScope::All, None, 1);
+        assert_eq!(page1[0].title, "Undated", "arrival time sorts it above a 2019 publication");
+        assert_eq!(
+            page1[0].sort_key, "2026-06-01 12:00:00",
+            "the cursor must carry a real value, never NULL"
+        );
+        assert!(more);
+
+        // Page past it: the cursor comparison must return the older entry
+        // instead of dropping the NULL-published row as `NULL < ?` would.
+        let (page2, more2) = page(&conn, "all", EntryScope::All, Some(&cursor_of(&page1[0])), 1);
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].title, "Dated 2019");
+        assert!(!more2, "nothing follows the last entry");
+    }
+
+    #[test]
+    fn consecutive_pages_cover_every_entry_exactly_once() {
+        let conn = open_memory().unwrap();
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        for i in 0..120 {
+            let published = format!("2026-01-01T{:02}:{:02}:00+00:00", i / 60, i % 60);
+            upsert_entry(&conn, f, &format!("g{i}"), &format!("E{i}"), None, "<p>x</p>", Some(&published)).unwrap();
+        }
+
+        let full: Vec<String> = list_all_entries(&conn, "all", EntryScope::All)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.title)
+            .collect();
+        assert_eq!(full.len(), 120);
+
+        let (page1, more1) = page(&conn, "all", EntryScope::All, None, 50);
+        let (page2, more2) = page(&conn, "all", EntryScope::All, Some(&cursor_of(&page1[49])), 50);
+        assert!(more1, "entries remain after the first page");
+        assert!(more2, "20 entries remain after the second");
+
+        let walked: Vec<String> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|e| e.title.clone())
+            .collect();
+        let unique: std::collections::BTreeSet<String> = walked.iter().cloned().collect();
+        assert_eq!(unique.len(), 100, "no entry appears on both pages");
+        assert_eq!(walked, full[..100], "pages follow the global order with no gaps");
+    }
+
+    #[test]
+    fn limit_plus_one_signals_whether_another_page_exists() {
+        let conn = open_memory().unwrap();
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        for i in 0..50 {
+            let published = format!("2026-01-01T{:02}:{:02}:00+00:00", i / 60, i % 60);
+            upsert_entry(&conn, f, &format!("g{i}"), &format!("E{i}"), None, "<p>x</p>", Some(&published)).unwrap();
+        }
+
+        // Exactly one full page: the probe row never arrives.
+        let rows = list_entries(&conn, "all", EntryScope::All, None, 50).unwrap();
+        assert_eq!(rows.len(), 50, "50 stored rows yield 50 returned rows");
+        let (page_rows, has_more) = page(&conn, "all", EntryScope::All, None, 50);
+        assert_eq!(page_rows.len(), 50);
+        assert!(!has_more, "a full but final page reports no more");
+
+        // One row too many: the probe row is what signals another page.
+        upsert_entry(&conn, f, "g50", "E50", None, "<p>x</p>", Some("2026-01-01T99:99:00+00:00")).unwrap();
+        let rows = list_entries(&conn, "all", EntryScope::All, None, 50).unwrap();
+        assert_eq!(rows.len(), 51, "the extra row exists only to signal more");
+        let (page_rows, has_more) = page(&conn, "all", EntryScope::All, None, 50);
+        assert_eq!(page_rows.len(), 50);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn count_entries_matches_each_filtered_view_and_scope() {
+        let conn = open_memory().unwrap();
+        let tech = create_folder(&conn, "Tech").unwrap();
+        let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
+        let c = insert_or_update_feed(&conn, "https://c.example/feed", "C", None).unwrap();
+        move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
+        move_feed_to_folder(&conn, b, Some(tech.id)).unwrap();
+        upsert_entry(&conn, a, "g1", "E1", None, "<p>x</p>", Some("2026-01-01T00:00:00+00:00")).unwrap();
+        upsert_entry(&conn, a, "g2", "E2", None, "<p>x</p>", Some("2026-01-02T00:00:00+00:00")).unwrap();
+        upsert_entry(&conn, b, "g3", "E4", None, "<p>x</p>", Some("2026-01-04T00:00:00+00:00")).unwrap();
+        upsert_entry(&conn, c, "g4", "E3", None, "<p>x</p>", Some("2026-01-03T00:00:00+00:00")).unwrap();
+        set_starred(&conn, 1, true).unwrap();
+        set_starred(&conn, 4, true).unwrap();
+        set_read(&conn, 2, true).unwrap();
+        set_read(&conn, 4, true).unwrap();
+
+        assert_eq!(count_entries(&conn, "all", EntryScope::All).unwrap(), 4);
+        assert_eq!(count_entries(&conn, "unread", EntryScope::All).unwrap(), 2);
+        assert_eq!(count_entries(&conn, "all", EntryScope::Feed { id: c }).unwrap(), 1);
+        assert_eq!(count_entries(&conn, "all", EntryScope::Folder { id: tech.id }).unwrap(), 3);
+        assert_eq!(count_entries(&conn, "all", EntryScope::Starred).unwrap(), 2);
+        assert_eq!(count_entries(&conn, "unread", EntryScope::Starred).unwrap(), 1);
+        assert!(count_entries(&conn, "bogus", EntryScope::All).is_err());
+
+        // The total must agree with what paging can actually walk.
+        for view in ["all", "unread"] {
+            for scope in [
+                EntryScope::All,
+                EntryScope::Feed { id: c },
+                EntryScope::Folder { id: tech.id },
+                EntryScope::Starred,
+            ] {
+                assert_eq!(
+                    count_entries(&conn, view, scope).unwrap() as usize,
+                    list_all_entries(&conn, view, scope).unwrap().len(),
+                    "count and listing must describe the same set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_entry_returns_content_for_stored_rows_and_none_for_unknown_ids() {
+        let conn = open_memory().unwrap();
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        upsert_entry(&conn, f, "g1", "T", Some("https://a/1"), "<p>body</p>", Some("2026-01-01T00:00:00+00:00")).unwrap();
+
+        let entry = get_entry(&conn, 1).unwrap().expect("stored entry is returned");
+        assert_eq!(entry.title, "T");
+        assert_eq!(entry.content_html, "<p>body</p>", "the reading pane needs the body");
+        assert!(get_entry(&conn, 999).unwrap().is_none(), "unknown id yields None");
+
+        // The list view of the same entry carries no body at all.
+        let row = list_all_entries(&conn, "all", EntryScope::All).unwrap().remove(0);
+        assert_eq!(row.published_at.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        assert!(!row.sort_key.is_empty());
     }
 
     #[test]
@@ -923,12 +1320,12 @@ mod tests {
 
         set_read(&conn, 1, true).unwrap();
         set_starred(&conn, 1, true).unwrap();
-        let entry = &list_entries(&conn, "all", EntryScope::All).unwrap()[0];
+        let entry = &list_all_entries(&conn, "all", EntryScope::All).unwrap()[0];
         assert!(entry.is_starred, "star persisted");
         assert!(entry.is_read, "read state untouched by starring");
 
         set_starred(&conn, 1, false).unwrap();
-        let entry = &list_entries(&conn, "all", EntryScope::All).unwrap()[0];
+        let entry = &list_all_entries(&conn, "all", EntryScope::All).unwrap()[0];
         assert!(!entry.is_starred);
         assert!(entry.is_read, "read state untouched by unstarring");
 
