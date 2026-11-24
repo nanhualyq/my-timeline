@@ -138,6 +138,23 @@ fn set_read(app: tauri::AppHandle, entry_id: i64, is_read: bool) -> Result<(), S
     db::set_read(&guard, entry_id, is_read)
 }
 
+/// Mark a batch of entries read. The ids come from the rows the list showed,
+/// so this can never reach an entry the reader has not seen.
+#[tauri::command]
+fn mark_read_many(app: tauri::AppHandle, ids: Vec<i64>) -> Result<i64, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::mark_read_many(&guard, &ids)
+}
+
+/// Mark every unread entry of a scope read, whether or not it was listed.
+#[tauri::command]
+fn mark_scope_read(app: tauri::AppHandle, scope: db::EntryScope) -> Result<i64, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::mark_scope_read(&guard, scope)
+}
+
 #[tauri::command]
 fn remove_feed(app: tauri::AppHandle, feed_id: i64) -> Result<(), String> {
     let conn = shared_conn(&app)?;
@@ -240,6 +257,8 @@ pub fn run() {
             move_feed_to_folder,
             set_feed_title,
             set_read,
+            mark_read_many,
+            mark_scope_read,
             set_starred,
             import_opml,
             export_opml,

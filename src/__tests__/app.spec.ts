@@ -319,3 +319,158 @@ describe("row detail wiring", () => {
     expect(wrapper.find(".entry-feed").exists()).toBe(false);
   });
 });
+
+describe("batch read", () => {
+  /** Every third seeded entry starts read, so a page holds 33-ish unread. */
+  function unreadIn(items: EntryListItem[]): EntryListItem[] {
+    return items.filter((r) => !r.is_read);
+  }
+
+  async function openFeed(wrapper: VueWrapper, id = 1): Promise<void> {
+    wrapper.findComponent(Sidebar).vm.$emit("select", { kind: "feed", id });
+    await flush();
+  }
+
+  it("is not offered in the unfiltered all-entries view", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    expect(list(wrapper).props("batchActionsAvailable")).toBe(false);
+    expect(wrapper.find(".mark-rendered").exists()).toBe(false);
+    expect(wrapper.find(".mark-above").exists()).toBe(false);
+  });
+
+  it("is not offered in the starred view", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    wrapper.findComponent(Sidebar).vm.$emit("select", { kind: "starred" });
+    await flush();
+    expect(wrapper.find(".mark-rendered").exists()).toBe(false);
+    expect(wrapper.find(".mark-above").exists()).toBe(false);
+  });
+
+  it("is offered in the global unread view", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    list(wrapper).vm.$emit("setView", "unread");
+    await flush();
+    expect(wrapper.find(".mark-rendered").exists()).toBe(true);
+  });
+
+  it("marks only the page the reader can see", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    await openFeed(wrapper);
+    const page = rows(wrapper);
+    expect(page).toHaveLength(50);
+    const pageUnread = unreadIn(page).length;
+    expect(backend.unreadFor(1)).toBe(80);
+
+    await wrapper.find(".mark-rendered").trigger("click");
+    await flush();
+
+    expect(backend.unreadFor(1)).toBe(80 - pageUnread);
+    // The page ends at id 71; older entries are untouched.
+    expect(backend.entries.find((e) => e.id === 70)?.is_read).toBe(false);
+  });
+
+  it("refills the unread page so the reader never has to scroll", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    list(wrapper).vm.$emit("setView", "unread");
+    await flush();
+    const before = rows(wrapper);
+    expect(before).toHaveLength(50);
+    const beforeIds = before.map((r) => r.id);
+
+    await wrapper.find(".mark-rendered").trigger("click");
+    await flush();
+
+    const after = rows(wrapper);
+    expect(after).toHaveLength(80 - before.length);
+    expect(list(wrapper).props("total")).toBe(80 - before.length);
+    expect(after.every((r) => !r.is_read)).toBe(true);
+    expect(after.some((r) => beforeIds.includes(r.id))).toBe(false);
+  });
+
+  it("leaves the row the action was used on, and everything below it, alone", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    await openFeed(wrapper);
+    const page = rows(wrapper);
+    // Snapshot the flags: the app patches the same objects it renders.
+    const aboveIds = unreadIn(page.slice(0, 5)).map((r) => r.id);
+    const untouchedIds = page.slice(5).filter((r) => !r.is_read).map((r) => r.id);
+    expect(aboveIds.length).toBeGreaterThan(0);
+
+    list(wrapper).vm.$emit("markAbove", 5);
+    await flush();
+
+    for (const id of aboveIds) {
+      expect(backend.entries.find((e) => e.id === id)?.is_read).toBe(true);
+    }
+    for (const id of untouchedIds) {
+      expect(backend.entries.find((e) => e.id === id)?.is_read).toBe(false);
+    }
+    // A feed's list also shows read entries, so nothing moves.
+    expect(rows(wrapper).map((r) => r.id)).toEqual(page.map((r) => r.id));
+  });
+
+  it("clears a whole feed from the sidebar, including entries never listed", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    expect(backend.unreadFor(1)).toBe(80);
+
+    const trigger = wrapper
+      .findAll(".row-menu-trigger")
+      .find((b) => b.attributes("title") === "Feed actions");
+    await trigger!.trigger("click");
+    const item = wrapper
+      .findAll(".row-menu-item")
+      .find((b) => b.text().startsWith("Mark all as read"));
+    await item!.trigger("click");
+    await flush();
+
+    expect(backend.unreadFor(1)).toBe(0);
+    expect(
+      backend.entries.every((e) => e.is_read),
+      "all 120 entries are read although only 50 were ever loaded",
+    ).toBe(true);
+    expect(wrapper.findAll(".entry.unread")).toHaveLength(0);
+  });
+
+  it("updates the open entry when a batch mark covers it", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    list(wrapper).vm.$emit("setView", "unread");
+    await flush();
+    const open = rows(wrapper)[0];
+
+    list(wrapper).vm.$emit("select", open);
+    await flush();
+    // Selecting marks it read; flip it back so the batch is what changes it.
+    pane(wrapper).vm.$emit("toggleRead");
+    await flush();
+    expect(pane(wrapper).props("entry")?.is_read).toBe(false);
+
+    await wrapper.find(".mark-rendered").trigger("click");
+    await flush();
+
+    expect(pane(wrapper).props("entry")?.is_read).toBe(true);
+  });
+
+  it("keeps the open entry in step when the sidebar clears its feed", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    await openFeed(wrapper);
+    const open = rows(wrapper).find((r) => !r.is_read)!;
+    list(wrapper).vm.$emit("select", open);
+    await flush();
+    pane(wrapper).vm.$emit("toggleRead");
+    await flush();
+    expect(pane(wrapper).props("entry")?.is_read).toBe(false);
+
+    const trigger = wrapper
+      .findAll(".row-menu-trigger")
+      .find((b) => b.attributes("title") === "Feed actions");
+    await trigger!.trigger("click");
+    const item = wrapper
+      .findAll(".row-menu-item")
+      .find((b) => b.text().startsWith("Mark all as read"));
+    await item!.trigger("click");
+    await flush();
+
+    expect(pane(wrapper).props("entry")?.id).toBe(open.id);
+    expect(pane(wrapper).props("entry")?.is_read).toBe(true);
+  });
+});

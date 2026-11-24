@@ -2,6 +2,7 @@
 import { computed, ref } from "vue";
 import {
   deleteFolder,
+  markScopeRead,
   renameFolder,
   type Feed,
   type Folder,
@@ -83,6 +84,8 @@ async function confirmDeleteFolder(folder: Folder) {
 
 function onFolderMenu(key: string, folder: Folder) {
   if (key === "refresh") emit("refreshFolder", folder.id);
+  else if (key === "markRead")
+    void runAction(() => markScopeRead({ kind: "folder", id: folder.id }));
   else if (key === "rename") renameFolderAction(folder);
   else if (key === "delete") void confirmDeleteFolder(folder);
 }
@@ -90,6 +93,8 @@ function onFolderMenu(key: string, folder: Folder) {
 function onFeedMenu(key: string, feed: Feed) {
   if (key === "edit") emit("edit", feed);
   else if (key === "refresh") emit("refreshOne", feed.id);
+  else if (key === "markRead")
+    void runAction(() => markScopeRead({ kind: "feed", id: feed.id }));
   else if (key === "remove") void confirmRemove(feed);
 }
 
@@ -97,15 +102,30 @@ const uncategorized = computed(() =>
   props.feeds.filter((f) => f.folder_id === null),
 );
 
-const folderMenuItems = [
+interface MenuItem {
+  key: string;
+  label: string;
+  danger?: boolean;
+}
+
+/** The whole-subscription batch action states its own size. It is absent when
+ *  nothing is unread, so the menu never offers a no-op. */
+function markAllItem(unreadCount: number): MenuItem[] {
+  if (unreadCount <= 0) return [];
+  return [{ key: "markRead", label: `Mark all as read (${unreadCount})` }];
+}
+
+const folderMenuItems = (folder: Folder): MenuItem[] => [
   { key: "refresh", label: "Refresh folder" },
+  ...markAllItem(folder.unread_count),
   { key: "rename", label: "Rename" },
   { key: "delete", label: "Delete", danger: true },
 ];
 
-const feedMenuItems = [
+const feedMenuItems = (feed: Feed): MenuItem[] => [
   { key: "edit", label: "Edit\u2026" },
   { key: "refresh", label: "Refresh" },
+  ...markAllItem(feed.unread_count),
   { key: "remove", label: "Remove", danger: true },
 ];
 
@@ -213,7 +233,7 @@ const items = computed<SidebarItem[]>(() => {
             </span>
           </button>
           <RowMenu
-            :items="folderMenuItems"
+            :items="folderMenuItems(item.folder)"
             trigger-title="Folder actions"
             :disabled="busy"
             @select="(key) => onFolderMenu(key, item.folder)"
@@ -240,7 +260,7 @@ const items = computed<SidebarItem[]>(() => {
             </span>
           </button>
           <RowMenu
-            :items="feedMenuItems"
+            :items="feedMenuItems(item.feed)"
             trigger-title="Feed actions"
             :disabled="busy"
             @select="(key) => onFeedMenu(key, item.feed)"

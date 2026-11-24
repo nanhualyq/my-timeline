@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import type { EntryListItem } from "../api";
 import { formatRelativeTime, fullTimestamp } from "../lib/time";
 
@@ -22,6 +22,9 @@ const props = defineProps<{
   feedTitles: Record<number, string>;
   /** False in a single feed's view, where the label repeats the sidebar. */
   showFeedLabel: boolean;
+  /** True when the current list is a triage queue (a feed, a folder, or the
+   *  global unread view), where batch marking belongs. */
+  batchActionsAvailable: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -30,6 +33,10 @@ const emit = defineEmits<{
   refreshAll: [];
   setView: [view: "all" | "unread"];
   loadMore: [];
+  /** Mark every unread row the list is showing. */
+  markRendered: [];
+  /** Mark the unread rows above the row at this index, excluding that row. */
+  markAbove: [index: number];
 }>();
 
 /** The scrolling list and the row at its end that asks for another batch. */
@@ -117,6 +124,18 @@ function fmtTime(entry: EntryListItem): string {
 function fullTime(entry: EntryListItem): string {
   return fullTimestamp(rowTime(entry));
 }
+
+/** Entries the header action would mark: everything unread on this page. */
+const renderedUnread = computed(
+  () => props.entries.filter((e) => !e.is_read).length,
+);
+
+/** Unread entries above the row at `index`, which is exactly what the row
+ *  action reaches: the list only ever appends downwards, so every newer entry
+ *  of the same list is already loaded. */
+function unreadAbove(index: number): number {
+  return props.entries.slice(0, index).filter((e) => !e.is_read).length;
+}
 </script>
 
 <template>
@@ -137,19 +156,30 @@ function fullTime(entry: EntryListItem): string {
           Unread
         </button>
       </div>
-      <button
-        class="refresh-all"
-        :disabled="busy"
-        title="Refresh all feeds"
-        @click="emit('refreshAll')"
-      >
-        {{ busy ? "Refreshing…" : "Refresh all" }}
-      </button>
+      <div class="list-actions">
+        <button
+          class="refresh-all"
+          :disabled="busy"
+          title="Refresh all feeds"
+          @click="emit('refreshAll')"
+        >
+          {{ busy ? "Refreshing…" : "Refresh all" }}
+        </button>
+        <button
+          v-if="batchActionsAvailable"
+          class="mark-rendered"
+          :disabled="busy || renderedUnread === 0"
+          :title="`Mark the ${renderedUnread} unread entries on this page as read`"
+          @click="emit('markRendered')"
+        >
+          Mark {{ renderedUnread }} read
+        </button>
+      </div>
     </header>
 
     <ul ref="listEl" class="entries">
       <li
-        v-for="entry in entries"
+        v-for="(entry, index) in entries"
         :key="entry.id"
         class="entry"
         :class="{ active: entry.id === selectedEntryId, unread: !entry.is_read }"
@@ -180,6 +210,19 @@ function fullTime(entry: EntryListItem): string {
           @click.stop="emit('toggleStar', entry)"
         >
           {{ entry.is_starred ? "\u2605" : "\u2606" }}
+        </button>
+        <!-- Floats over the row on hover/focus and reserves no column, so a
+             row without the action keeps its previous layout. The arrow
+             carries the count the action would mark. -->
+        <button
+          v-if="batchActionsAvailable && unreadAbove(index) > 0"
+          class="mark-above"
+          :disabled="busy"
+          :title="`Mark the ${unreadAbove(index)} unread entries above this one as read`"
+          :aria-label="`Mark ${unreadAbove(index)} entries above as read`"
+          @click.stop="emit('markAbove', index)"
+        >
+          &#8593;{{ unreadAbove(index) }}
         </button>
       </li>
       <li v-if="entries.length === 0" class="empty">No entries.</li>
@@ -226,6 +269,11 @@ function fullTime(entry: EntryListItem): string {
   display: flex;
   gap: 2px;
 }
+.list-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
 .view-tabs button {
   border: none;
   background: transparent;
@@ -246,6 +294,18 @@ function fullTime(entry: EntryListItem): string {
 }
 .refresh-all:disabled {
   opacity: 0.6;
+  cursor: default;
+}
+.mark-rendered {
+  border: 1px solid #2d7ff9;
+  background: #f2f7ff;
+  color: #1d5fc4;
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.mark-rendered:disabled {
+  opacity: 0.45;
   cursor: default;
 }
 .entries {
@@ -273,6 +333,10 @@ function fullTime(entry: EntryListItem): string {
   height: 7.5rem;
   overflow: hidden;
   box-sizing: border-box;
+  /* The row-level batch action floats over the row on hover instead of
+     taking a flex column, so the row layout does not pay for a control the
+     reader only uses occasionally. */
+  position: relative;
   padding: 0.55rem 0.75rem;
   border-bottom: 1px solid #eee;
   cursor: pointer;
@@ -370,6 +434,37 @@ function fullTime(entry: EntryListItem): string {
 }
 .star.starred {
   color: #d4a017;
+}
+.mark-above {
+  /* Floats over the row's top-right corner, just left of the star: no column
+     is reserved, so a row without the action looks exactly like before. */
+  position: absolute;
+  top: 0.4rem;
+  right: 1.75rem;
+  cursor: pointer;
+  font-size: 0.7rem;
+  line-height: 1;
+  padding: 0.22rem 0.35rem;
+  border: 1px solid #bcd4f7;
+  border-radius: 10px;
+  background: #eef4ff;
+  color: #1d5fc4;
+  /* Hidden until the reader points at the row. */
+  opacity: 0;
+  pointer-events: none;
+}
+.entry:hover .mark-above,
+.mark-above:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.mark-above:hover:not(:disabled) {
+  background: #dbe9ff;
+}
+.mark-above:disabled {
+  opacity: 0;
+  pointer-events: none;
+  cursor: default;
 }
 .empty {
   padding: 1rem 0.75rem;

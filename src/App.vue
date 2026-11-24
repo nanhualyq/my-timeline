@@ -15,6 +15,7 @@ import {
   refreshFeed,
   refreshFolder,
   removeFeed,
+  markReadMany,
   setRead,
   setStarred,
   entryCounts,
@@ -85,6 +86,15 @@ const feedTitles = computed<Record<number, string>>(() => {
 
 /** The label is omitted where the sidebar already shows the same feed. */
 const showEntryFeedLabel = computed(() => selection.value.kind !== "feed");
+
+/** Batch marking acts on the rows on screen, so it belongs to lists whose
+ *  contents are still to be dealt with: a feed, a folder, or the global unread
+ *  view. "All entries" unfiltered is an archive and Starred is a shelf. */
+const batchActionsAvailable = computed(() => {
+  const sel = selection.value;
+  if (sel.kind === "feed" || sel.kind === "folder") return true;
+  return sel.kind === "all" && view.value === "unread";
+});
 
 /** The view the list is actually showing: tabs only apply to the global
  *  views, and the starred view never has an unread filter. */
@@ -180,6 +190,18 @@ async function reload() {
       await loadFirstBatch();
     } else {
       await fetchWindow(Math.max(entries.value.length, PAGE_SIZE));
+    }
+    // The open entry is a separate object from the list rows, so whatever
+    // triggered this reload may have changed it (a whole-feed batch mark from
+    // the sidebar, a refresh, or its feed being removed). Re-read that one row
+    // rather than letting the reading pane's toggle go stale.
+    if (selectedEntryId.value !== null) {
+      const id = selectedEntryId.value;
+      const full = await getEntry(id);
+      if (selectedEntryId.value === id) {
+        selectedEntry.value = full;
+        if (full === null) selectedEntryId.value = null;
+      }
     }
     loadError.value = null;
   } catch (e) {
@@ -287,6 +309,43 @@ async function applyRead(entry: Entry, isRead: boolean) {
 function toggleRead() {
   const entry = selectedEntry.value;
   if (entry) void applyRead(entry, !entry.is_read);
+}
+
+/** Mark every unread row the list is showing. Ids always come from rows that
+ *  are on screen, so a batch can never reach an entry the reader has not seen. */
+function markRenderedRead() {
+  void applyBatchRead(
+    entries.value.filter((e) => !e.is_read).map((e) => e.id),
+  );
+}
+
+/** Mark the unread rows above `index`, excluding that row: the list only
+ *  appends downwards, so everything above a loaded row is loaded too. */
+function markAboveRead(index: number) {
+  void applyBatchRead(
+    entries.value
+      .slice(0, index)
+      .filter((e) => !e.is_read)
+      .map((e) => e.id),
+  );
+}
+
+async function applyBatchRead(ids: number[]) {
+  if (ids.length === 0) return;
+  try {
+    await markReadMany(ids);
+    // The client knows exactly which rows it marked, so no refetch is needed
+    // for the rows or the open entry.
+    for (const id of ids) patchEntry(id, { is_read: true });
+    if (activeView() === "unread") {
+      // Those rows just left the list; refill the page from the newest batch
+      // so the reader never has to scroll to reach the next page.
+      startOver();
+    }
+    await refreshCounts();
+  } catch (e) {
+    loadError.value = String(e);
+  }
 }
 
 async function toggleStar(entry: EntryListItem) {
@@ -410,11 +469,14 @@ onMounted(reload);
       :loading-more="loadingMore"
       :feed-titles="feedTitles"
       :show-feed-label="showEntryFeedLabel"
+      :batch-actions-available="batchActionsAvailable"
       @select="selectEntry"
       @toggle-star="toggleStar"
       @refresh-all="doRefreshAll"
       @set-view="setView"
       @load-more="loadMore"
+      @mark-rendered="markRenderedRead"
+      @mark-above="markAboveRead"
     />
     <ReadingPane
       :entry="selectedEntry"

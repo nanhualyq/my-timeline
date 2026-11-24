@@ -38,6 +38,7 @@ function render(overrides: Partial<Record<string, unknown>> = {}): VueWrapper {
       loadingMore: false,
       feedTitles: { 1: "Feed One" },
       showFeedLabel: true,
+      batchActionsAvailable: true,
       ...overrides,
     },
   });
@@ -229,5 +230,69 @@ describe("row detail", () => {
       ],
     });
     expect(wrapper.find(".entry-date").text()).toBe("2h");
+  });
+});
+
+describe("batch read actions", () => {
+  /** Newest first, as the list renders: three unread and one read in between. */
+  function mixedRows(): EntryListItem[] {
+    return [
+      makeRow(4),
+      makeRow(3),
+      makeRow(2, { is_read: true }),
+      makeRow(1),
+    ];
+  }
+
+  function markAboveButtons(wrapper: VueWrapper) {
+    return wrapper.findAll(".mark-above");
+  }
+
+  it("labels the header action with the unread rows on this page", () => {
+    const wrapper = render({ entries: mixedRows() });
+    expect(wrapper.find(".mark-rendered").text()).toBe("Mark 3 read");
+  });
+
+  it("marks the rendered page, not the whole selection", async () => {
+    const wrapper = render({ entries: mixedRows(), total: 12_438 });
+    await wrapper.find(".mark-rendered").trigger("click");
+    expect(wrapper.emitted("markRendered")).toHaveLength(1);
+  });
+
+  it("disables the header action when the page holds no unread rows", () => {
+    const wrapper = render({
+      entries: [makeRow(2, { is_read: true }), makeRow(1, { is_read: true })],
+    });
+    expect(wrapper.find(".mark-rendered").attributes("disabled")).toBeDefined();
+  });
+
+  it("offers neither action when the list is not a triage list", () => {
+    const wrapper = render({
+      entries: mixedRows(),
+      view: "all",
+      batchActionsAvailable: false,
+    });
+    expect(wrapper.find(".mark-rendered").exists()).toBe(false);
+    expect(markAboveButtons(wrapper)).toHaveLength(0);
+  });
+
+  it("labels each row action with the unread entries above it", () => {
+    const wrapper = render({ entries: mixedRows() });
+    const labels = markAboveButtons(wrapper).map((b) => b.text());
+    // Row 0 has nothing above it; row 1 has one unread above; rows 2 and 3
+    // both see the two unread entries at the top of the list.
+    expect(labels).toEqual(["↑1", "↑2", "↑2"]);
+  });
+
+  it("emits the row index so the app can slice the loaded rows", async () => {
+    const wrapper = render({ entries: mixedRows() });
+    await markAboveButtons(wrapper)[1].trigger("click");
+    expect(wrapper.emitted("markAbove")).toEqual([[2]]);
+  });
+
+  it("does not open the entry whose row action was used", async () => {
+    const wrapper = render({ entries: mixedRows() });
+    await markAboveButtons(wrapper)[0].trigger("click");
+    expect(wrapper.emitted("select")).toBeUndefined();
   });
 });

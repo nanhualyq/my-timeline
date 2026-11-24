@@ -488,6 +488,50 @@ pub fn set_read(
     Ok(())
 }
 
+/// Ids per statement when marking a batch read. Deep scrolling can leave
+/// thousands of rows loaded, so the id list is chunked rather than trusting
+/// SQLite's bound-parameter limit to stay out of reach.
+const READ_BATCH_CHUNK: usize = 500;
+
+/// Mark the given entries read. Ids that are already read, or that no longer
+/// exist, are not counted: the return value is the number of rows that actually
+/// changed. The whole batch is one transaction, so a failure cannot leave it
+/// half applied.
+pub fn mark_read_many(conn: &Connection, ids: &[i64]) -> Result<i64, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut changed = 0i64;
+    for chunk in ids.chunks(READ_BATCH_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "UPDATE entries SET is_read = 1 WHERE is_read = 0 AND id IN ({placeholders})"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        changed += tx.execute(&sql, params.as_slice()).map_err(|e| e.to_string())? as i64;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+/// Mark every unread entry matching a scope read, whether or not it was ever
+/// listed. Shares `filter_conditions` with listing and counting, so the rows
+/// touched are exactly the ones the unread view would have shown.
+pub fn mark_scope_read(conn: &Connection, scope: EntryScope) -> Result<i64, String> {
+    let (conditions, params) = filter_conditions("unread", scope)?;
+    let sql = format!(
+        "UPDATE entries SET is_read = 1 {}",
+        where_clause(&conditions)
+    );
+    let refs = bind_refs(&params);
+    let changed = conn
+        .execute(&sql, refs.as_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(changed as i64)
+}
+
 /// Star or unstar an entry. Independent of read state.
 pub fn set_starred(
     conn: &Connection,
@@ -1685,5 +1729,101 @@ mod tests {
             "uncategorized feed excluded"
         );
         assert!(feed_ids_and_urls_in_folder(&conn, 999).is_err(), "unknown folder rejected");
+    }
+
+    #[test]
+    fn mark_read_many_marks_only_the_listed_ids_and_counts_real_changes() {
+        let conn = open_memory().unwrap();
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        for i in 1..=4 {
+            insert_entry(&conn, f, &format!("g{i}"), "T", None, "<p>x</p>", None).unwrap();
+        }
+        set_read(&conn, 3, true).unwrap();
+
+        let changed = mark_read_many(&conn, &[1, 2, 3]).unwrap();
+        assert_eq!(changed, 2, "an already-read id is not counted as changed");
+
+        let rows = list_all_entries(&conn, "all", EntryScope::All).unwrap();
+        assert_eq!(rows.len(), 4);
+        let read: Vec<bool> = (1..=4).map(|id| rows_read(&conn, id)).collect();
+        assert_eq!(read, vec![true, true, true, false], "id 4 untouched");
+
+        assert_eq!(mark_read_many(&conn, &[]).unwrap(), 0, "empty batch is a no-op");
+        assert_eq!(
+            mark_read_many(&conn, &[999]).unwrap(),
+            0,
+            "unknown ids are ignored rather than failing the batch"
+        );
+    }
+
+    #[test]
+    fn mark_read_many_covers_batches_larger_than_one_chunk() {
+        let conn = open_memory().unwrap();
+        let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        let total = READ_BATCH_CHUNK + 200;
+        for i in 0..total {
+            insert_entry(&conn, f, &format!("g{i}"), "T", None, "<p>x</p>", None).unwrap();
+        }
+        let ids: Vec<i64> = (1..=total as i64).collect();
+
+        assert_eq!(mark_read_many(&conn, &ids).unwrap(), total as i64);
+        assert_eq!(
+            count_entries(&conn, "unread", EntryScope::All).unwrap(),
+            0,
+            "every chunk was applied"
+        );
+    }
+
+    #[test]
+    fn mark_scope_read_matches_the_unread_view_of_each_scope() {
+        let conn = open_memory().unwrap();
+        let tech = create_folder(&conn, "Tech").unwrap();
+        let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
+        let c = insert_or_update_feed(&conn, "https://c.example/feed", "C", None).unwrap();
+        move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
+        move_feed_to_folder(&conn, b, Some(tech.id)).unwrap();
+        insert_entry(&conn, a, "g1", "E1", None, "<p>x</p>", Some("2026-01-01T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, a, "g2", "E2", None, "<p>x</p>", Some("2026-01-02T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, b, "g3", "E3", None, "<p>x</p>", Some("2026-01-03T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, c, "g4", "E4", None, "<p>x</p>", Some("2026-01-04T00:00:00+00:00")).unwrap();
+        set_read(&conn, 4, true).unwrap();
+
+        let unread_before = count_entries(&conn, "unread", EntryScope::Folder { id: tech.id }).unwrap();
+        let changed = mark_scope_read(&conn, EntryScope::Folder { id: tech.id }).unwrap();
+        assert_eq!(changed, unread_before, "the scope's unread count is what changes");
+        assert_eq!(count_entries(&conn, "unread", EntryScope::Folder { id: tech.id }).unwrap(), 0);
+        assert_eq!(
+            count_entries(&conn, "unread", EntryScope::Feed { id: c }).unwrap(),
+            0,
+            "the feed outside the folder was already read"
+        );
+        assert_eq!(
+            mark_scope_read(&conn, EntryScope::Folder { id: tech.id }).unwrap(),
+            0,
+            "a second pass changes nothing"
+        );
+
+        // Feed scope leaves the sibling feed alone; All scope reaches everything.
+        assert_eq!(mark_scope_read(&conn, EntryScope::Feed { id: c }).unwrap(), 0);
+        insert_entry(&conn, c, "g5", "E5", None, "<p>x</p>", Some("2026-01-05T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, b, "g7", "E7", None, "<p>x</p>", Some("2026-01-07T00:00:00+00:00")).unwrap();
+        assert_eq!(mark_scope_read(&conn, EntryScope::Feed { id: c }).unwrap(), 1);
+        assert_eq!(
+            count_entries(&conn, "unread", EntryScope::Feed { id: b }).unwrap(),
+            1,
+            "marking one feed leaves its sibling unread"
+        );
+        assert_eq!(mark_scope_read(&conn, EntryScope::All).unwrap(), 1);
+        assert_eq!(count_entries(&conn, "unread", EntryScope::All).unwrap(), 0);
+    }
+
+    /// Read flags by id, in list order, for the batch tests' assertions.
+    fn rows_read(conn: &Connection, id: i64) -> bool {
+        conn.query_row("SELECT is_read FROM entries WHERE id = ?1", params![id], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+            != 0
     }
 }

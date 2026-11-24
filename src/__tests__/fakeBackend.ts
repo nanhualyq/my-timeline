@@ -103,9 +103,21 @@ export class FakeBackend {
   private dispatch(cmd: string, args: Args): unknown {
     switch (cmd) {
       case "list_feeds":
-        return this.feeds;
+        return this.feeds.map((f) => ({
+          ...f,
+          unread_count: this.unreadFor(f.id),
+        }));
       case "list_folders":
-        return this.folders;
+        return this.folders.map((folder) => {
+          const feeds = this.feeds
+            .filter((f) => f.folder_id === folder.id)
+            .map((f) => ({ ...f, unread_count: this.unreadFor(f.id) }));
+          return {
+            ...folder,
+            feeds,
+            unread_count: feeds.reduce((n, f) => n + f.unread_count, 0),
+          };
+        });
       case "entry_counts":
         return {
           all_entries: this.entries.length,
@@ -123,6 +135,26 @@ export class FakeBackend {
         const entry = this.entries.find((e) => e.id === args.entryId);
         if (entry) entry.is_read = args.isRead === true;
         return null;
+      }
+      case "mark_read_many": {
+        // Mirrors `db::mark_read_many`: only unread rows count as changed.
+        const ids = (args.ids ?? []) as number[];
+        let changed = 0;
+        for (const entry of this.entries) {
+          if (ids.includes(entry.id) && !entry.is_read) {
+            entry.is_read = true;
+            changed += 1;
+          }
+        }
+        return changed;
+      }
+      case "mark_scope_read": {
+        // Mirrors `db::mark_scope_read`: the unread view of the scope is
+        // exactly the set that changes, loaded rows or not.
+        const scope = args.scope as EntryScope;
+        const targets = this.filtered({ view: "unread", scope });
+        for (const entry of targets) entry.is_read = true;
+        return targets.length;
       }
       case "set_starred": {
         const entry = this.entries.find((e) => e.id === args.entryId);
@@ -163,13 +195,23 @@ export class FakeBackend {
     return tail.slice(0, limit + 1).map((e) => ({ ...e }));
   }
 
+  /** Unread entries of one feed, the figure `db::list_feeds` computes in SQL. */
+  unreadFor(feedId: number): number {
+    return this.entries.filter((e) => e.feed_id === feedId && !e.is_read).length;
+  }
+
   private filtered(args: Args): StoredEntry[] {
     const view = args.view as EntryView;
     const scope = args.scope as EntryScope;
     return this.entries.filter((e) => {
       if (scope.kind === "feed" && e.feed_id !== scope.id) return false;
       if (scope.kind === "starred" && !e.is_starred) return false;
-      if (scope.kind === "folder") return false; // no folders seeded in tests
+      if (scope.kind === "folder") {
+        const inFolder = this.feeds.some(
+          (f) => f.id === e.feed_id && f.folder_id === scope.id,
+        );
+        if (!inFolder) return false;
+      }
       if (view === "unread" && e.is_read) return false;
       return true;
     });

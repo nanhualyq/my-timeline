@@ -125,6 +125,19 @@ export function setRead(entryId: number, isRead: boolean): Promise<void> {
   return invoke("set_read", { entryId, isRead });
 }
 
+/** Mark the given entries read in one round trip. The ids come from rows the
+ * list has already shown, so this never reaches an entry the reader has not
+ * seen. Resolves with the number of rows whose state actually changed. */
+export function markReadMany(ids: number[]): Promise<number> {
+  return invoke<number>("mark_read_many", { ids });
+}
+
+/** Mark every unread entry of a scope read, including entries that were never
+ * listed. Resolves with the number of rows whose state actually changed. */
+export function markScopeRead(scope: EntryScope): Promise<number> {
+  return invoke<number>("mark_scope_read", { scope });
+}
+
 export function entryCounts(): Promise<EntryCounts> {
   return invoke<EntryCounts>("entry_counts");
 }
