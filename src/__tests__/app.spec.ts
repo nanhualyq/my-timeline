@@ -289,3 +289,33 @@ describe("scope reset", () => {
     expect(list(wrapper).props("viewedCount")).toBe(50);
   });
 });
+
+describe("row detail wiring", () => {
+  it("passes feed titles to the list so rows can name their feed", async () => {
+    backend = new FakeBackend({ entries: 4, feeds: 2 });
+    backend.feeds[0].title = "Renamed Feed";
+    harness.backend = backend;
+    const wrapper = mount(App);
+    await flush();
+
+    expect(list(wrapper).props("feedTitles")).toMatchObject({
+      1: "Renamed Feed",
+      2: "Feed 2",
+    });
+
+    const labels = wrapper.findAll(".entry-feed").map((n) => n.text());
+    expect(labels).toContain("Renamed Feed");
+    expect(labels).toContain("Feed 2");
+  });
+
+  it("stops showing the feed label once a single feed is selected", async () => {
+    const wrapper = await mountApp({ entries: 4, feeds: 2 });
+    expect(list(wrapper).props("showFeedLabel")).toBe(true);
+
+    wrapper.findComponent(Sidebar).vm.$emit("select", { kind: "feed", id: 1 });
+    await flush();
+
+    expect(list(wrapper).props("showFeedLabel")).toBe(false);
+    expect(wrapper.find(".entry-feed").exists()).toBe(false);
+  });
+});

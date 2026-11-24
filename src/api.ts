@@ -32,14 +32,18 @@ export interface Entry {
 
 /**
  * One row of the paginated entry list. Deliberately carries no
- * `content_html`: the list renders a title and a date, and bodies are fetched
- * on demand for the entry being read.
+ * `content_html`: the list renders a cover, a title, a short excerpt, and a
+ * date, and bodies are fetched on demand for the entry being read.
  */
 export interface EntryListItem {
   id: number;
   feed_id: number;
   title: string;
   link: string | null;
+  /** Plain-text snippet derived at ingest; empty when the entry has no text. */
+  excerpt: string;
+  /** Absolute cover image URL, when the feed declared or contained one. */
+  image_url: string | null;
   published_at: string | null;
   /** Ordering position — publication time when known, arrival time otherwise.
    * Echoed back as the cursor for the next page. */

@@ -45,6 +45,11 @@ const COLUMN_MIGRATIONS: &[&str] = &[
     // Arrival time. Needed for a total ordering: `published_at` is nullable,
     // and keyset paging cannot compare against NULL.
     "ALTER TABLE entries ADD COLUMN created_at TEXT",
+    // Row detail: a plain-text snippet and an absolute cover image URL, both
+    // derived at ingest. NULL means "stored before these existed", which is
+    // exactly what the one-time backfill looks for.
+    "ALTER TABLE entries ADD COLUMN excerpt TEXT",
+    "ALTER TABLE entries ADD COLUMN image_url TEXT",
 ];
 
 /// Indexes that depend on migrated columns.
@@ -75,7 +80,12 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "UPDATE entries SET created_at = datetime('now') WHERE created_at IS NULL",
         [],
     )?;
-    conn.execute_batch(POST_MIGRATION)
+    conn.execute_batch(POST_MIGRATION)?;
+    // Derive row detail for entries stored before those columns existed. Only
+    // touches rows whose excerpt is still NULL, so it self-terminates and is
+    // safe to call on every open.
+    backfill_row_details(conn)?;
+    Ok(())
 }
 
 /// Open (creating if needed) the application database at `path` and apply the schema.
@@ -173,19 +183,82 @@ pub fn upsert_entry(
     title: &str,
     link: Option<&str>,
     content_html: &str,
+    excerpt: &str,
+    image_url: Option<&str>,
     published_at: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO entries (feed_id, guid, title, link, content_html, published_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+        "INSERT INTO entries
+           (feed_id, guid, title, link, content_html, excerpt, image_url, published_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
          ON CONFLICT(feed_id, guid) DO UPDATE SET
            title = excluded.title,
            link = excluded.link,
            content_html = excluded.content_html,
+           excerpt = excluded.excerpt,
+           image_url = excluded.image_url,
            published_at = COALESCE(excluded.published_at, entries.published_at)",
-        params![feed_id, guid, title, link, content_html, published_at],
+        params![
+            feed_id,
+            guid,
+            title,
+            link,
+            content_html,
+            excerpt,
+            image_url,
+            published_at
+        ],
     )?;
     Ok(())
+}
+
+/// Derive `excerpt` and `image_url` for entries that predate those columns,
+/// from the content already stored, so the list gains row detail without
+/// re-fetching every feed.
+///
+/// `excerpt IS NULL` is the work queue: every insert writes an excerpt (possibly
+/// empty), so a NULL unambiguously means "not backfilled yet". Work happens in
+/// bounded batches inside one transaction, so an interrupted run resumes where
+/// it stopped instead of restarting. Only these two columns are written.
+pub fn backfill_row_details(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    const BATCH: i64 = 200;
+    let mut processed = 0usize;
+    let mut cursor = i64::MIN;
+    loop {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, content_html FROM entries
+                 WHERE excerpt IS NULL AND id > ?1
+                 ORDER BY id LIMIT ?2",
+            )?;
+            let mapped = stmt.query_map(params![cursor, BATCH], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let tx = conn.unchecked_transaction()?;
+        for (id, content_html) in &rows {
+            let excerpt = crate::rowdetail::excerpt_from_html(content_html);
+            // No media metadata survives for old rows, so the body's first image
+            // is the only cover source; a later refresh upgrades it.
+            let image_url = crate::rowdetail::cover_from_html(content_html, &[]);
+            tx.execute(
+                "UPDATE entries SET excerpt = ?1, image_url = ?2 WHERE id = ?3",
+                params![excerpt, image_url, id],
+            )?;
+        }
+        tx.commit()?;
+        let batch_len = rows.len();
+        processed += batch_len;
+        cursor = rows[batch_len - 1].0;
+        if batch_len < BATCH as usize {
+            break;
+        }
+    }
+    Ok(processed)
 }
 
 /// All feeds with unread entry counts, newest-fetch order not assumed (UI sorts if needed).
@@ -228,15 +301,19 @@ pub struct EntryCursor {
 }
 
 /// One row of a paginated entry list. Carries no `content_html`: the list
-/// only renders a title and a date, and bodies are fetched on demand for the
-/// entry being read. `sort_key` is echoed back by the frontend as the cursor
-/// for the following page.
+/// renders a short excerpt and a cover, and bodies are fetched on demand for
+/// the entry being read. `sort_key` is echoed back by the frontend as the
+/// cursor for the following page.
 #[derive(Debug, Clone, Serialize)]
 pub struct EntryListItemDto {
     pub id: i64,
     pub feed_id: i64,
     pub title: String,
     pub link: Option<String>,
+    /// Plain-text snippet; empty when the entry has no text to preview.
+    pub excerpt: String,
+    /// Absolute cover image URL, when one was derived at ingest.
+    pub image_url: Option<String>,
     pub published_at: Option<String>,
     pub sort_key: String,
     pub is_read: bool,
@@ -307,7 +384,8 @@ pub fn list_entries(
     }
     params.push(Box::new(limit.max(0) + 1));
     let sql = format!(
-        "SELECT id, feed_id, title, link, published_at, {key} AS sort_key, is_read, is_starred
+        "SELECT id, feed_id, title, link, published_at, {key} AS sort_key, is_read, is_starred,
+                COALESCE(excerpt, ''), image_url
          FROM entries {where}
          ORDER BY {key} DESC, id DESC
          LIMIT ?",
@@ -334,6 +412,8 @@ fn map_list_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntryListItemDto> {
         sort_key: r.get(5)?,
         is_read: is_read != 0,
         is_starred: is_starred != 0,
+        excerpt: r.get(8)?,
+        image_url: r.get(9)?,
     })
 }
 
@@ -673,6 +753,38 @@ pub fn list_folders(conn: &Connection) -> Result<Vec<FolderDto>, String> {
 mod tests {
     use super::*;
 
+    /// Insert without going through the row-detail arguments the legacy tests
+    /// do not care about. `excerpt` is written as empty rather than NULL, so a
+    /// test-inserted row is never mistaken for one awaiting backfill.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_entry(
+        conn: &Connection,
+        feed_id: i64,
+        guid: &str,
+        title: &str,
+        link: Option<&str>,
+        content_html: &str,
+        published_at: Option<&str>,
+    ) -> Result<(), rusqlite::Error> {
+        upsert_entry(
+            conn,
+            feed_id,
+            guid,
+            title,
+            link,
+            content_html,
+            "",
+            None,
+            published_at,
+        )
+    }
+
+    /// A feed row with a URL/title derived from `slug`, for tests that only
+    /// need a valid foreign key.
+    fn insert_feed(conn: &Connection, slug: &str) -> i64 {
+        insert_or_update_feed(conn, &format!("https://{slug}.example/feed"), slug, None).unwrap()
+    }
+
     #[test]
     fn schema_creates_both_tables() {
         let conn = open_memory().unwrap();
@@ -784,6 +896,131 @@ mod tests {
             )
             .unwrap();
         assert_eq!(created_at, 1);
+
+        for column in ["excerpt", "image_url"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = ?1",
+                    params![column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "entries must gain the {column} column");
+        }
+    }
+
+    #[test]
+    fn upsert_updates_row_detail_in_place() {
+        let conn = open_memory().unwrap();
+        let f = insert_feed(&conn, "row-detail");
+        upsert_entry(
+            &conn,
+            f,
+            "g1",
+            "v1",
+            None,
+            "<p>one</p>",
+            "one",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        // A later fetch supplies an image where there was none.
+        upsert_entry(
+            &conn,
+            f,
+            "g1",
+            "v2",
+            None,
+            "<p>two</p>",
+            "two",
+            Some("https://img.example/cover.jpg"),
+            Some("2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
+
+        let rows = list_all_entries(&conn, "all", EntryScope::All).unwrap();
+        assert_eq!(rows.len(), 1, "re-upserting the same GUID must not duplicate");
+        assert_eq!(rows[0].excerpt, "two");
+        assert_eq!(
+            rows[0].image_url.as_deref(),
+            Some("https://img.example/cover.jpg")
+        );
+    }
+
+    #[test]
+    fn list_returns_row_detail_and_no_entry_body() {
+        let conn = open_memory().unwrap();
+        let f = insert_feed(&conn, "row-detail-list");
+        upsert_entry(
+            &conn,
+            f,
+            "g1",
+            "Title",
+            None,
+            "<p>secret body</p>",
+            "secret body",
+            Some("https://img.example/c.jpg"),
+            Some("2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+
+        let rows = list_all_entries(&conn, "all", EntryScope::All).unwrap();
+        assert_eq!(rows[0].excerpt, "secret body");
+        assert_eq!(rows[0].image_url.as_deref(), Some("https://img.example/c.jpg"));
+
+        // The response shape must still keep bodies out of the list payload.
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(!json.contains("content_html"), "list rows carry no body field");
+        assert!(!json.contains("<p>"), "list rows carry no stored HTML");
+    }
+
+    #[test]
+    fn backfill_fills_row_detail_without_touching_reading_state() {
+        let conn = open_memory().unwrap();
+        let f = insert_feed(&conn, "backfill");
+        insert_entry(
+            &conn,
+            f,
+            "g1",
+            "Old",
+            None,
+            "<p>Hello &amp; welcome</p><img src=\"https://img.example/a.jpg\">",
+            Some("2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        insert_entry(
+            &conn,
+            f,
+            "g2",
+            "Bare",
+            None,
+            "<p>No picture here</p>",
+            None,
+        )
+        .unwrap();
+        // Pretend both rows were stored before the columns existed.
+        conn.execute("UPDATE entries SET excerpt = NULL, image_url = NULL", [])
+            .unwrap();
+        set_read(&conn, 1, true).unwrap();
+        set_starred(&conn, 1, true).unwrap();
+
+        let processed = backfill_row_details(&conn).unwrap();
+        assert_eq!(processed, 2);
+
+        let rows = list_all_entries(&conn, "all", EntryScope::All).unwrap();
+        let old = rows.iter().find(|r| r.id == 1).unwrap();
+        assert_eq!(old.excerpt, "Hello & welcome");
+        assert_eq!(old.image_url.as_deref(), Some("https://img.example/a.jpg"));
+        assert!(old.is_read, "read state must survive the backfill");
+        assert!(old.is_starred, "starred state must survive the backfill");
+        assert_eq!(old.published_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        let bare = rows.iter().find(|r| r.id == 2).unwrap();
+        assert_eq!(bare.excerpt, "No picture here");
+        assert_eq!(bare.image_url, None);
+
+        // Second run finds nothing left to do.
+        assert_eq!(backfill_row_details(&conn).unwrap(), 0);
     }
 
     #[test]
@@ -914,10 +1151,10 @@ mod tests {
         move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
         move_feed_to_folder(&conn, b, Some(tech.id)).unwrap();
 
-        upsert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, a, "g2", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, b, "g3", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, c, "g4", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, a, "g2", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, b, "g3", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, c, "g4", "T", None, "<p>x</p>", None).unwrap();
 
         let folders = list_folders(&conn).unwrap();
         assert_eq!(folders.len(), 1);
@@ -993,8 +1230,8 @@ mod tests {
         let conn = open_memory().unwrap();
         let feed_id = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
 
-        upsert_entry(&conn, feed_id, "g1", "Title v1", Some("https://a/1"), "<p>one</p>", Some("2026-01-01T00:00:00Z")).unwrap();
-        upsert_entry(&conn, feed_id, "g1", "Title v2", Some("https://a/1"), "<p>two</p>", Some("2026-01-02T00:00:00Z")).unwrap();
+        insert_entry(&conn, feed_id, "g1", "Title v1", Some("https://a/1"), "<p>one</p>", Some("2026-01-01T00:00:00Z")).unwrap();
+        insert_entry(&conn, feed_id, "g1", "Title v2", Some("https://a/1"), "<p>two</p>", Some("2026-01-02T00:00:00Z")).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
@@ -1011,7 +1248,7 @@ mod tests {
         let conn = open_memory().unwrap();
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
 
-        upsert_entry(&conn, f, "g1", "v1", None, "<p>one</p>", Some("2026-01-01T00:00:00Z")).unwrap();
+        insert_entry(&conn, f, "g1", "v1", None, "<p>one</p>", Some("2026-01-01T00:00:00Z")).unwrap();
         let initial: String = conn
             .query_row("SELECT created_at FROM entries", [], |r| r.get(0))
             .unwrap();
@@ -1020,7 +1257,7 @@ mod tests {
         // Pin it so the assertion does not depend on clock resolution.
         conn.execute("UPDATE entries SET created_at = '2020-01-01 00:00:00'", [])
             .unwrap();
-        upsert_entry(&conn, f, "g1", "v2", None, "<p>two</p>", Some("2026-01-02T00:00:00Z")).unwrap();
+        insert_entry(&conn, f, "g1", "v2", None, "<p>two</p>", Some("2026-01-02T00:00:00Z")).unwrap();
 
         let (created, title): (String, String) = conn
             .query_row("SELECT created_at, title FROM entries", [], |r| {
@@ -1036,8 +1273,8 @@ mod tests {
         let conn = open_memory().unwrap();
         let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
         let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
-        upsert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, b, "g1", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, b, "g1", "T", None, "<p>x</p>", None).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap();
@@ -1049,8 +1286,8 @@ mod tests {
         let conn = open_memory().unwrap();
         let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
         let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
-        upsert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, b, "g2", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, b, "g2", "T", None, "<p>x</p>", None).unwrap();
 
         delete_feed(&conn, a).unwrap();
 
@@ -1068,9 +1305,9 @@ mod tests {
     fn list_entries_filters_and_orders_newest_first() {
         let conn = open_memory().unwrap();
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
-        upsert_entry(&conn, f, "g1", "Old", None, "<p>x</p>", Some("2026-01-01T00:00:00Z")).unwrap();
-        upsert_entry(&conn, f, "g2", "New", None, "<p>x</p>", Some("2026-02-01T00:00:00Z")).unwrap();
-        upsert_entry(&conn, f, "g3", "Mid", None, "<p>x</p>", Some("2026-01-15T00:00:00Z")).unwrap();
+        insert_entry(&conn, f, "g1", "Old", None, "<p>x</p>", Some("2026-01-01T00:00:00Z")).unwrap();
+        insert_entry(&conn, f, "g2", "New", None, "<p>x</p>", Some("2026-02-01T00:00:00Z")).unwrap();
+        insert_entry(&conn, f, "g3", "Mid", None, "<p>x</p>", Some("2026-01-15T00:00:00Z")).unwrap();
 
         let all = list_all_entries(&conn, "all", EntryScope::All).unwrap();
         let titles: Vec<&str> = all.iter().map(|e| e.title.as_str()).collect();
@@ -1097,10 +1334,10 @@ mod tests {
         move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
         move_feed_to_folder(&conn, b, Some(tech.id)).unwrap();
         // c stays uncategorized.
-        upsert_entry(&conn, a, "g1", "E1", None, "<p>x</p>", Some("2026-01-01T00:00:00Z")).unwrap();
-        upsert_entry(&conn, a, "g2", "E2", None, "<p>x</p>", Some("2026-01-02T00:00:00Z")).unwrap();
-        upsert_entry(&conn, b, "g3", "E4", None, "<p>x</p>", Some("2026-01-04T00:00:00Z")).unwrap();
-        upsert_entry(&conn, c, "g4", "E3", None, "<p>x</p>", Some("2026-01-03T00:00:00Z")).unwrap();
+        insert_entry(&conn, a, "g1", "E1", None, "<p>x</p>", Some("2026-01-01T00:00:00Z")).unwrap();
+        insert_entry(&conn, a, "g2", "E2", None, "<p>x</p>", Some("2026-01-02T00:00:00Z")).unwrap();
+        insert_entry(&conn, b, "g3", "E4", None, "<p>x</p>", Some("2026-01-04T00:00:00Z")).unwrap();
+        insert_entry(&conn, c, "g4", "E3", None, "<p>x</p>", Some("2026-01-03T00:00:00Z")).unwrap();
 
         // e1 (feed a): starred + unread; e2: read; e4 (feed b): unread; e3 (feed c): starred + read.
         set_starred(&conn, 1, true).unwrap();
@@ -1171,8 +1408,8 @@ mod tests {
     fn undated_entries_order_by_arrival_and_stay_reachable() {
         let conn = open_memory().unwrap();
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
-        upsert_entry(&conn, f, "g1", "Dated 2019", None, "<p>x</p>", Some("2019-05-01T00:00:00+00:00")).unwrap();
-        upsert_entry(&conn, f, "g2", "Undated", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, f, "g1", "Dated 2019", None, "<p>x</p>", Some("2019-05-01T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, f, "g2", "Undated", None, "<p>x</p>", None).unwrap();
         // Deterministic arrival time, newer than the dated entry's publication.
         conn.execute(
             "UPDATE entries SET created_at = '2026-06-01 12:00:00' WHERE guid = 'g2'",
@@ -1202,7 +1439,7 @@ mod tests {
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
         for i in 0..120 {
             let published = format!("2026-01-01T{:02}:{:02}:00+00:00", i / 60, i % 60);
-            upsert_entry(&conn, f, &format!("g{i}"), &format!("E{i}"), None, "<p>x</p>", Some(&published)).unwrap();
+            insert_entry(&conn, f, &format!("g{i}"), &format!("E{i}"), None, "<p>x</p>", Some(&published)).unwrap();
         }
 
         let full: Vec<String> = list_all_entries(&conn, "all", EntryScope::All)
@@ -1233,7 +1470,7 @@ mod tests {
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
         for i in 0..50 {
             let published = format!("2026-01-01T{:02}:{:02}:00+00:00", i / 60, i % 60);
-            upsert_entry(&conn, f, &format!("g{i}"), &format!("E{i}"), None, "<p>x</p>", Some(&published)).unwrap();
+            insert_entry(&conn, f, &format!("g{i}"), &format!("E{i}"), None, "<p>x</p>", Some(&published)).unwrap();
         }
 
         // Exactly one full page: the probe row never arrives.
@@ -1244,7 +1481,7 @@ mod tests {
         assert!(!has_more, "a full but final page reports no more");
 
         // One row too many: the probe row is what signals another page.
-        upsert_entry(&conn, f, "g50", "E50", None, "<p>x</p>", Some("2026-01-01T99:99:00+00:00")).unwrap();
+        insert_entry(&conn, f, "g50", "E50", None, "<p>x</p>", Some("2026-01-01T99:99:00+00:00")).unwrap();
         let rows = list_entries(&conn, "all", EntryScope::All, None, 50).unwrap();
         assert_eq!(rows.len(), 51, "the extra row exists only to signal more");
         let (page_rows, has_more) = page(&conn, "all", EntryScope::All, None, 50);
@@ -1261,10 +1498,10 @@ mod tests {
         let c = insert_or_update_feed(&conn, "https://c.example/feed", "C", None).unwrap();
         move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
         move_feed_to_folder(&conn, b, Some(tech.id)).unwrap();
-        upsert_entry(&conn, a, "g1", "E1", None, "<p>x</p>", Some("2026-01-01T00:00:00+00:00")).unwrap();
-        upsert_entry(&conn, a, "g2", "E2", None, "<p>x</p>", Some("2026-01-02T00:00:00+00:00")).unwrap();
-        upsert_entry(&conn, b, "g3", "E4", None, "<p>x</p>", Some("2026-01-04T00:00:00+00:00")).unwrap();
-        upsert_entry(&conn, c, "g4", "E3", None, "<p>x</p>", Some("2026-01-03T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, a, "g1", "E1", None, "<p>x</p>", Some("2026-01-01T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, a, "g2", "E2", None, "<p>x</p>", Some("2026-01-02T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, b, "g3", "E4", None, "<p>x</p>", Some("2026-01-04T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, c, "g4", "E3", None, "<p>x</p>", Some("2026-01-03T00:00:00+00:00")).unwrap();
         set_starred(&conn, 1, true).unwrap();
         set_starred(&conn, 4, true).unwrap();
         set_read(&conn, 2, true).unwrap();
@@ -1299,7 +1536,7 @@ mod tests {
     fn get_entry_returns_content_for_stored_rows_and_none_for_unknown_ids() {
         let conn = open_memory().unwrap();
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
-        upsert_entry(&conn, f, "g1", "T", Some("https://a/1"), "<p>body</p>", Some("2026-01-01T00:00:00+00:00")).unwrap();
+        insert_entry(&conn, f, "g1", "T", Some("https://a/1"), "<p>body</p>", Some("2026-01-01T00:00:00+00:00")).unwrap();
 
         let entry = get_entry(&conn, 1).unwrap().expect("stored entry is returned");
         assert_eq!(entry.title, "T");
@@ -1316,7 +1553,7 @@ mod tests {
     fn set_starred_is_independent_of_read_state_and_persists() {
         let conn = open_memory().unwrap();
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
-        upsert_entry(&conn, f, "g1", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, f, "g1", "T", None, "<p>x</p>", None).unwrap();
 
         set_read(&conn, 1, true).unwrap();
         set_starred(&conn, 1, true).unwrap();
@@ -1339,9 +1576,9 @@ mod tests {
         assert_eq!((empty.all_entries, empty.starred_entries), (0, 0), "zero-entry case");
 
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
-        upsert_entry(&conn, f, "g1", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, f, "g2", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, f, "g3", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, f, "g1", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, f, "g2", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, f, "g3", "T", None, "<p>x</p>", None).unwrap();
 
         let counts = entry_counts(&conn).unwrap();
         assert_eq!((counts.all_entries, counts.starred_entries), (3, 0));
@@ -1367,9 +1604,9 @@ mod tests {
         let conn = open_memory().unwrap();
         let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
         let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
-        upsert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, a, "g2", "T", None, "<p>x</p>", None).unwrap();
-        upsert_entry(&conn, b, "g3", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, a, "g2", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, b, "g3", "T", None, "<p>x</p>", None).unwrap();
 
         let feeds = list_feeds(&conn).unwrap();
         let counts: Vec<(i64, i64)> = feeds.iter().map(|f| (f.id, f.unread_count)).collect();

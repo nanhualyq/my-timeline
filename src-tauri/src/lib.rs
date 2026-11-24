@@ -2,6 +2,7 @@ mod db;
 mod fetch;
 mod opml;
 mod reader;
+mod rowdetail;
 
 use reader::{AddFeedResult, SharedConn};
 use std::sync::{Arc, Mutex};

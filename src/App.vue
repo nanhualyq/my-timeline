@@ -75,6 +75,17 @@ const selectedFeed = computed(() => {
   return feeds.value.find((f) => f.id === entry.feed_id) ?? null;
 });
 
+/** Display titles by feed id, so list rows can name their feed without a
+ *  second request. `Feed.title` is already the custom-or-provided title. */
+const feedTitles = computed<Record<number, string>>(() => {
+  const titles: Record<number, string> = {};
+  for (const feed of feeds.value) titles[feed.id] = feed.title;
+  return titles;
+});
+
+/** The label is omitted where the sidebar already shows the same feed. */
+const showEntryFeedLabel = computed(() => selection.value.kind !== "feed");
+
 /** The view the list is actually showing: tabs only apply to the global
  *  views, and the starred view never has an unread filter. */
 function activeView(): EntryView {
@@ -397,6 +408,8 @@ onMounted(reload);
       :total="total"
       :has-more="hasMore"
       :loading-more="loadingMore"
+      :feed-titles="feedTitles"
+      :show-feed-label="showEntryFeedLabel"
       @select="selectEntry"
       @toggle-star="toggleStar"
       @refresh-all="doRefreshAll"

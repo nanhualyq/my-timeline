@@ -1,4 +1,5 @@
 use crate::db;
+use crate::rowdetail;
 use chrono::Utc;
 use feed_rs::parser as feed_parser;
 use rusqlite::Connection;
@@ -18,6 +19,10 @@ pub struct ParsedEntry {
     pub title: String,
     pub link: Option<String>,
     pub content_html: String,
+    /// Plain-text snippet for the entry list, derived at parse time.
+    pub excerpt: String,
+    /// Absolute cover image URL, when the entry declares or contains an image.
+    pub image_url: Option<String>,
     pub published_at: Option<String>,
 }
 
@@ -76,17 +81,31 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
             }; // feed-rs already applies the link fallback via the id generator above
             let title = e
                 .title
-                .map(|t| t.content)
+                .as_ref()
+                .map(|t| t.content.clone())
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| "(no title)".to_string());
+            // The publisher's own abstract, before any tag stripping.
+            let summary_html = e.summary.as_ref().map(|s| s.content.clone()).unwrap_or_default();
             // Prefer full content, fall back to summary.
             let raw = e
                 .content
-                .and_then(|c| c.body)
+                .as_ref()
+                .and_then(|c| c.body.clone())
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| e.summary.map(|s| s.content))
-                .unwrap_or_default();
+                .unwrap_or_else(|| summary_html.clone());
             let content_html = ammonia::clean(&raw);
+            // A summary is literally an abstract, so it makes the better snippet;
+            // content is only the fallback when the feed offers none.
+            let excerpt = {
+                let from_summary = rowdetail::excerpt_from_html(&summary_html);
+                if from_summary.is_empty() {
+                    rowdetail::excerpt_from_html(&content_html)
+                } else {
+                    from_summary
+                }
+            };
+            let image_url = rowdetail::cover_from_entry(&e, &content_html, site_url.as_deref());
             let published = e
                 .published
                 .or(e.updated)
@@ -96,6 +115,8 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
                 title,
                 link,
                 content_html,
+                excerpt,
+                image_url,
                 published_at: published,
             }
         })
@@ -121,6 +142,8 @@ pub fn store_feed(conn: &Connection, url: &str, parsed: &ParsedFeed) -> Result<i
             &e.title,
             e.link.as_deref(),
             &e.content_html,
+            &e.excerpt,
+            e.image_url.as_deref(),
             e.published_at.as_deref(),
         )
         .map_err(|e| e.to_string())?;
@@ -197,6 +220,67 @@ mod tests {
         let second = &parsed.entries[1];
         assert_eq!(second.guid, "https://fixture.example/2", "guid falls back to link");
         assert!(second.published_at.is_none());
+    }
+
+    const DETAIL_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/"
+     xmlns:media="http://search.yahoo.com/mrss/">
+  <channel>
+    <title>Detail Feed</title>
+    <link>https://detail.example/</link>
+    <item>
+      <title>Both summary and content</title>
+      <link>https://detail.example/1</link>
+      <guid>d-1</guid>
+      <description>&lt;p&gt;The publisher's own &lt;b&gt;abstract&lt;/b&gt;.&lt;/p&gt;</description>
+      <content:encoded><![CDATA[<p>Full body text that should not become the excerpt.</p>]]></content:encoded>
+      <media:thumbnail url="https://img.example/thumb.jpg"/>
+    </item>
+    <item>
+      <title>Content only</title>
+      <link>https://detail.example/2</link>
+      <guid>d-2</guid>
+      <content:encoded><![CDATA[<p>Body &amp; nothing else</p>]]></content:encoded>
+    </item>
+    <item>
+      <title>No picture</title>
+      <link>https://detail.example/3</link>
+      <guid>d-3</guid>
+      <description>Plain description, no images.</description>
+    </item>
+  </channel>
+</rss>"#;
+
+    #[test]
+    fn excerpt_prefers_the_feed_summary() {
+        let parsed = parse_feed(DETAIL_FIXTURE.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.entries[0].excerpt,
+            "The publisher's own abstract.",
+            "the summary is the better snippet"
+        );
+    }
+
+    #[test]
+    fn excerpt_falls_back_to_content() {
+        let parsed = parse_feed(DETAIL_FIXTURE.as_bytes()).unwrap();
+        assert_eq!(parsed.entries[1].excerpt, "Body & nothing else");
+    }
+
+    #[test]
+    fn cover_is_parsed_when_the_entry_has_one() {
+        let parsed = parse_feed(DETAIL_FIXTURE.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.entries[0].image_url.as_deref(),
+            Some("https://img.example/thumb.jpg")
+        );
+    }
+
+    #[test]
+    fn entry_without_images_has_no_cover() {
+        let parsed = parse_feed(DETAIL_FIXTURE.as_bytes()).unwrap();
+        assert_eq!(parsed.entries[2].image_url, None);
+        assert_eq!(parsed.entries[2].excerpt, "Plain description, no images.");
     }
 
     #[test]

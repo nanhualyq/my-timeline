@@ -9,6 +9,8 @@ export interface StoredEntry {
   title: string;
   link: string | null;
   content_html: string;
+  excerpt: string;
+  image_url: string | null;
   published_at: string | null;
   sort_key: string;
   is_read: boolean;
@@ -61,6 +63,9 @@ export class FakeBackend {
         title: `Entry ${i}`,
         link: `https://example.test/${i}`,
         content_html: `<p>Body ${i}</p>`,
+        excerpt: `Body ${i}`,
+        // Every other entry carries a cover, so tests see both row shapes.
+        image_url: i % 2 === 0 ? `https://img.example/${i}.jpg` : null,
         published_at: stamp(i),
         sort_key: stamp(i),
         // Every third entry starts read: 120 seeded -> 40 read, 80 unread.
