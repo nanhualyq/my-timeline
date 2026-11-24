@@ -53,7 +53,11 @@ const selectedEntryId = ref<number | null>(null);
  *  away from the open entry does not close the reading pane. */
 const selectedEntry = ref<Entry | null>(null);
 const view = ref<EntryView>("all");
-const counts = ref<EntryCounts>({ all_entries: 0, starred_entries: 0 });
+const counts = ref<EntryCounts>({
+  all_entries: 0,
+  starred_entries: 0,
+  unread_entries: 0,
+});
 const busy = ref(false);
 const loadError = ref<string | null>(null);
 const editingFeed = ref<Feed | null>(null);
@@ -449,6 +453,7 @@ onMounted(reload);
       :busy="busy"
       :all-count="counts.all_entries"
       :starred-count="counts.starred_entries"
+      :unread-count="counts.unread_entries"
       @select="select"
       @changed="reload"
       @remove="doRemove"

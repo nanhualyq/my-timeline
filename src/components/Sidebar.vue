@@ -7,8 +7,7 @@ import {
   type Feed,
   type Folder,
   type Selection,
-} from "../api";
-import RowMenu from "./RowMenu.vue";
+} from "../api";import RowMenu from "./RowMenu.vue";
 import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 
 const props = defineProps<{
@@ -20,6 +19,8 @@ const props = defineProps<{
   allCount: number;
   /** Total starred entries, for the "Starred" badge. */
   starredCount: number;
+  /** Unread entries across the whole library, for the global batch action. */
+  unreadCount: number;
 }>();
 
 const emit = defineEmits<{
@@ -129,6 +130,14 @@ const feedMenuItems = (feed: Feed): MenuItem[] => [
   { key: "remove", label: "Remove", danger: true },
 ];
 
+/** The "All entries" row is the whole library, so its batch item's range is
+ *  every unread entry regardless of the selection the list shows. */
+const globalMenuItems = (): MenuItem[] => markAllItem(props.unreadCount);
+
+function onGlobalMenu(key: string) {
+  if (key === "markRead") void runAction(() => markScopeRead({ kind: "all" }));
+}
+
 type SidebarItem =
   | { key: string; type: "label"; label: string }
   | { key: string; type: "folder"; folder: Folder }
@@ -171,14 +180,25 @@ const items = computed<SidebarItem[]>(() => {
     <p v-if="actionError" class="error">{{ actionError }}</p>
 
     <nav class="feed-list">
-      <button
-        class="feed-item global"
-        :class="{ active: selection.kind === 'all' }"
-        @click="emit('select', { kind: 'all' })"
-      >
-        <span class="feed-title">All entries</span>
-        <span v-if="allCount > 0" class="unread-badge">{{ allCount }}</span>
-      </button>
+      <div class="feed-row">
+        <button
+          class="feed-item global"
+          :class="{ active: selection.kind === 'all' }"
+          @click="emit('select', { kind: 'all' })"
+        >
+          <span class="feed-title">All entries</span>
+          <span v-if="allCount > 0" class="unread-badge">{{ allCount }}</span>
+        </button>
+        <!-- Only rendered when the library holds unread entries: the menu has
+             nothing else to offer, so an empty one would be noise. -->
+        <RowMenu
+          v-if="unreadCount > 0"
+          :items="globalMenuItems()"
+          trigger-title="All entries actions"
+          :disabled="busy"
+          @select="onGlobalMenu"
+        />
+      </div>
       <button
         class="feed-item global"
         :class="{ active: selection.kind === 'starred' }"

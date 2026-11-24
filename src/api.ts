@@ -74,6 +74,8 @@ export type EntryView = "all" | "unread";
 export interface EntryCounts {
   all_entries: number;
   starred_entries: number;
+  /** Unread entries across the whole library, for the global batch action. */
+  unread_entries: number;
 }
 
 /** Which entries to list. The starred view is global: it never combines

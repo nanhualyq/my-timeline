@@ -550,24 +550,31 @@ pub fn set_starred(
     Ok(())
 }
 
-/// Aggregate counts for the two global sidebar rows.
+/// Aggregate counts for the global sidebar rows.
 #[derive(Debug, Clone, Serialize)]
 pub struct EntryCountsDto {
     /// Total stored entries, read and unread alike.
     pub all_entries: i64,
     /// Total starred entries, read and unread alike.
     pub starred_entries: i64,
+    /// Unread entries across the whole library, for the global batch action's
+    /// label. Returned by the same statement as the other two so the figure
+    /// can never disagree with the badges it sits beside.
+    pub unread_entries: i64,
 }
 
-/// Total and starred entry counts in one statement, for the global sidebar badges.
+/// Total, starred, and unread entry counts in one statement, for the global
+/// sidebar badges and the library-wide batch action.
 pub fn entry_counts(conn: &Connection) -> Result<EntryCountsDto, rusqlite::Error> {
     conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(is_starred), 0) FROM entries",
+        "SELECT COUNT(*), COALESCE(SUM(is_starred), 0), COALESCE(SUM(is_read = 0), 0)
+         FROM entries",
         [],
         |r| {
             Ok(EntryCountsDto {
                 all_entries: r.get(0)?,
                 starred_entries: r.get(1)?,
+                unread_entries: r.get(2)?,
             })
         },
     )
@@ -1617,7 +1624,11 @@ mod tests {
     fn entry_counts_cover_totals_and_stars() {
         let conn = open_memory().unwrap();
         let empty = entry_counts(&conn).unwrap();
-        assert_eq!((empty.all_entries, empty.starred_entries), (0, 0), "zero-entry case");
+        assert_eq!(
+            (empty.all_entries, empty.starred_entries, empty.unread_entries),
+            (0, 0, 0),
+            "zero-entry case"
+        );
 
         let f = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
         insert_entry(&conn, f, "g1", "T", None, "<p>x</p>", None).unwrap();
@@ -1625,22 +1636,43 @@ mod tests {
         insert_entry(&conn, f, "g3", "T", None, "<p>x</p>", None).unwrap();
 
         let counts = entry_counts(&conn).unwrap();
-        assert_eq!((counts.all_entries, counts.starred_entries), (3, 0));
+        assert_eq!(
+            (counts.all_entries, counts.starred_entries, counts.unread_entries),
+            (3, 0, 3)
+        );
 
         // Starred counts include read and unread entries alike.
         set_starred(&conn, 1, true).unwrap();
         set_starred(&conn, 3, true).unwrap();
         let counts = entry_counts(&conn).unwrap();
-        assert_eq!((counts.all_entries, counts.starred_entries), (3, 2));
+        assert_eq!(
+            (counts.all_entries, counts.starred_entries, counts.unread_entries),
+            (3, 2, 3)
+        );
 
-        // Read state changes neither count.
+        // Read state changes the unread total, never the other two.
         set_read(&conn, 1, true).unwrap();
         let counts = entry_counts(&conn).unwrap();
-        assert_eq!((counts.all_entries, counts.starred_entries), (3, 2));
+        assert_eq!(
+            (counts.all_entries, counts.starred_entries, counts.unread_entries),
+            (3, 2, 2)
+        );
 
         set_starred(&conn, 1, false).unwrap();
         let counts = entry_counts(&conn).unwrap();
-        assert_eq!((counts.all_entries, counts.starred_entries), (3, 1));
+        assert_eq!(
+            (counts.all_entries, counts.starred_entries, counts.unread_entries),
+            (3, 1, 2)
+        );
+
+        // The library-wide total is what the unread view of every scope adds up
+        // to, so the global batch label can never overstate its range.
+        set_read(&conn, 2, true).unwrap();
+        set_read(&conn, 3, true).unwrap();
+        assert_eq!(
+            entry_counts(&conn).unwrap().unread_entries,
+            count_entries(&conn, "unread", EntryScope::All).unwrap()
+        );
     }
 
     #[test]

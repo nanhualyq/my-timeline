@@ -474,3 +474,55 @@ describe("batch read", () => {
     expect(pane(wrapper).props("entry")?.is_read).toBe(true);
   });
 });
+
+describe("library-wide batch read", () => {
+  async function markEverything(wrapper: VueWrapper): Promise<void> {
+    const trigger = wrapper
+      .findAll(".row-menu-trigger")
+      .find((b) => b.attributes("title") === "All entries actions");
+    if (!trigger) throw new Error("the All entries row has no menu");
+    await trigger.trigger("click");
+    const item = wrapper
+      .findAll(".row-menu-item")
+      .find((b) => b.text().startsWith("Mark all as read"));
+    await item!.trigger("click");
+    await flush();
+  }
+
+  it("labels the All entries row with the library's unread total", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 2 });
+    expect(wrapper.findComponent(Sidebar).props("unreadCount")).toBe(80);
+    expect(backend.unreadFor(1) + backend.unreadFor(2)).toBe(80);
+  });
+
+  it("marks everything read from a feed's unread view, unloaded rows included", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 2 });
+    wrapper.findComponent(Sidebar).vm.$emit("select", { kind: "feed", id: 1 });
+    await flush();
+    list(wrapper).vm.$emit("setView", "unread");
+    await flush();
+    const open = rows(wrapper)[0];
+    list(wrapper).vm.$emit("select", open);
+    await flush();
+
+    await markEverything(wrapper);
+
+    expect(
+      backend.entries.every((e) => e.is_read),
+      "not only feed 1's entries",
+    ).toBe(true);
+    expect(rows(wrapper), "the unread list is empty").toHaveLength(0);
+    expect(pane(wrapper).props("entry")?.is_read, "the open entry was re-read").toBe(true);
+    expect(wrapper.findComponent(Sidebar).props("unreadCount")).toBe(0);
+  });
+
+  it("offers no library-wide action once nothing is unread", async () => {
+    const wrapper = await mountApp({ entries: 6, feeds: 1 });
+    await markEverything(wrapper);
+    expect(
+      wrapper
+        .findAll(".row-menu-trigger")
+        .some((b) => b.attributes("title") === "All entries actions"),
+    ).toBe(false);
+  });
+});

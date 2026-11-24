@@ -52,15 +52,18 @@ function render(
       busy: false,
       allCount: 6,
       starredCount: 0,
+      unreadCount: 4,
       ...props,
     },
   });
 }
 
+type MenuTitle = "Feed actions" | "Folder actions" | "All entries actions";
+
 /** Open a row's menu and return its item labels. */
 async function menuItems(
   wrapper: VueWrapper,
-  title: "Feed actions" | "Folder actions",
+  title: MenuTitle,
 ): Promise<string[]> {
   const trigger = wrapper
     .findAll(".row-menu-trigger")
@@ -73,7 +76,7 @@ async function menuItems(
 
 async function choose(
   wrapper: VueWrapper,
-  title: "Feed actions" | "Folder actions",
+  title: MenuTitle,
   label: string,
 ): Promise<void> {
   const trigger = wrapper
@@ -168,5 +171,59 @@ describe("whole-subscription batch read", () => {
 
     expect(wrapper.find(".error").text()).toContain("database is locked");
     expect(wrapper.emitted("changed")).toBeUndefined();
+  });
+});
+
+describe("library-wide batch read", () => {
+  it("states the library's unread count on the All entries row", async () => {
+    const wrapper = render({ unreadCount: 80 });
+    expect(await menuItems(wrapper, "All entries actions")).toEqual([
+      "Mark all as read (80)",
+    ]);
+  });
+
+  it("hides the menu when the library has nothing unread", () => {
+    const wrapper = render({ unreadCount: 0 });
+    const trigger = wrapper
+      .findAll(".row-menu-trigger")
+      .find((b) => b.attributes("title") === "All entries actions");
+    expect(trigger, "nothing for the menu to offer").toBeUndefined();
+  });
+
+  it("marks the whole library read regardless of the selection", async () => {
+    const wrapper = render({
+      unreadCount: 80,
+      selection: { kind: "feed", id: 1 },
+    });
+    await choose(wrapper, "All entries actions", "Mark all as read (80)");
+
+    expect(backend.calls[backend.calls.length - 1]).toEqual({
+      cmd: "mark_scope_read",
+      args: { scope: { kind: "all" } },
+    });
+    expect(backend.entries.every((e) => e.is_read)).toBe(true);
+    expect(wrapper.emitted("changed")).toHaveLength(1);
+  });
+
+  it("surfaces a failure without asking the app to reload", async () => {
+    harness.backend = {
+      invoke: async (cmd: string) => {
+        if (cmd === "mark_scope_read") throw new Error("database is locked");
+        return null;
+      },
+    };
+    const wrapper = render({ unreadCount: 80 });
+    await choose(wrapper, "All entries actions", "Mark all as read (80)");
+
+    expect(wrapper.find(".error").text()).toContain("database is locked");
+    expect(wrapper.emitted("changed")).toBeUndefined();
+  });
+
+  it("offers the starred row no batch action", async () => {
+    const wrapper = render({ unreadCount: 80 });
+    const titles = wrapper
+      .findAll(".row-menu-trigger")
+      .map((b) => b.attributes("title"));
+    expect(titles).toEqual(["All entries actions", "Feed actions"]);
   });
 });

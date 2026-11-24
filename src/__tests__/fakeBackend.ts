@@ -122,6 +122,7 @@ export class FakeBackend {
         return {
           all_entries: this.entries.length,
           starred_entries: this.entries.filter((e) => e.is_starred).length,
+          unread_entries: this.entries.filter((e) => !e.is_read).length,
         };
       case "list_entries":
         return this.listEntries(args);

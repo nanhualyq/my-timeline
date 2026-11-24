@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Lets a reader acknowledge entries in batches — the ones currently on screen, or a whole subscription at once — instead of opening every entry to clear it from the unread list.
+Lets a reader acknowledge entries in batches — the ones currently on screen, a whole subscription, or the whole library at once — instead of opening every entry to clear it from the unread list.
 
 ## Requirements
 
@@ -59,9 +59,9 @@ The header and row batch actions SHALL be offered when the current list is a sin
 - **WHEN** the user selects the Starred view
 - **THEN** neither batch read action is offered
 
-### Requirement: A subscription's whole backlog can be marked read from the sidebar
+### Requirement: Batch read is offered per subscription and for the whole library
 
-A feed's and a folder's sidebar row menu SHALL offer an action that marks every unread entry of that subscription or folder as read, including entries never loaded into the list. This action SHALL be available regardless of which view or selection the list currently shows, and SHALL be absent on the "All entries" and "Starred" rows. The action SHALL NOT be offered for a subscription or folder with no unread entries.
+A feed's and a folder's sidebar row menu SHALL offer an action that marks every unread entry of that subscription or folder as read, including entries never loaded into the list. The "All entries" row's menu SHALL offer an equivalent action covering every unread entry in the library, whichever feed or folder it belongs to. Both actions SHALL be available regardless of which view or selection the list currently shows. The "Starred" row SHALL offer no batch action, and an action SHALL NOT be offered when the range it covers holds no unread entries.
 
 #### Scenario: Marking a whole feed read
 
@@ -73,15 +73,25 @@ A feed's and a folder's sidebar row menu SHALL offer an action that marks every 
 - **WHEN** the list is showing the Starred view and the user activates "mark all as read" from a folder's sidebar row menu
 - **THEN** every unread entry of that folder's feeds becomes read and the Starred list's starring is unaffected
 
-#### Scenario: Global rows offer no whole-collection action
+#### Scenario: Marking every entry in the library read
 
-- **WHEN** the user inspects the "All entries" and "Starred" sidebar rows
-- **THEN** neither offers a batch read action
+- **WHEN** the library holds 12,438 unread entries spread over several feeds and folders and the user activates "mark all as read" from the "All entries" row's menu
+- **THEN** every stored entry becomes read, including entries never loaded into the list
+
+#### Scenario: The global action ignores the current view
+
+- **WHEN** the list is showing the unread view of a single feed and the user activates "mark all as read" from the "All entries" row's menu
+- **THEN** every unread entry in the library becomes read, not only the selected feed's entries
+
+#### Scenario: Starred row offers no batch action
+
+- **WHEN** the user inspects the "Starred" sidebar row
+- **THEN** it offers no batch read action
 
 #### Scenario: Nothing unread to mark
 
-- **WHEN** a feed or folder has no unread entries
-- **THEN** its row menu does not offer the whole-subscription batch action
+- **WHEN** a feed, a folder, or the library has no unread entries
+- **THEN** the corresponding row menu does not offer its batch action
 
 ### Requirement: Batch actions state how many entries they will affect
 
