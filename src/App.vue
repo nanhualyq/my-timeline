@@ -52,7 +52,9 @@ const selectedEntryId = ref<number | null>(null);
 /** Loaded through `getEntry` rather than looked up in `entries`, so paging
  *  away from the open entry does not close the reading pane. */
 const selectedEntry = ref<Entry | null>(null);
-const view = ref<EntryView>("all");
+/** The list filter. Unread everywhere by default; the Starred view ignores
+ *  it and always shows every starred entry. */
+const view = ref<EntryView>("unread");
 const counts = ref<EntryCounts>({
   all_entries: 0,
   starred_entries: 0,
@@ -100,11 +102,11 @@ const batchActionsAvailable = computed(() => {
   return sel.kind === "all" && view.value === "unread";
 });
 
-/** The view the list is actually showing: tabs only apply to the global
- *  views, and the starred view never has an unread filter. */
+/** The view the list is actually showing. The filter applies to whatever is
+ *  selected; only the starred shelf is above it. */
 function activeView(): EntryView {
   if (selection.value.kind === "starred") return "all";
-  return isGlobal(selection.value) ? view.value : "all";
+  return view.value;
 }
 
 const displayView = computed<EntryView>(() => activeView());
@@ -123,10 +125,6 @@ function scopeOf(sel: Selection): EntryScope {
     case "feed":
       return { kind: "feed", id: sel.id };
   }
-}
-
-function isGlobal(sel: Selection): boolean {
-  return sel.kind === "all" || sel.kind === "starred";
 }
 
 async function refreshCounts() {
@@ -257,14 +255,12 @@ function select(sel: Selection) {
 
 function setView(v: EntryView) {
   // The starred view has no unread filter, so tab clicks there are ignored
-  // (the tab is hidden anyway); this also keeps "All entries"' tab intact.
+  // (the tabs are hidden anyway).
   if (selection.value.kind === "starred") return;
+  // The filter belongs to the list, not to the global views: choosing All
+  // inside a feed keeps that feed selected. The choice carries over to the
+  // next selection, so browsing a feed's archive does not reset on every hop.
   view.value = v;
-  // Tabs only apply to the global views; a feed/folder selection falls back
-  // to "All entries" (the starred view keeps its scope).
-  if (!isGlobal(selection.value)) {
-    selection.value = { kind: "all" };
-  }
   startOver();
 }
 

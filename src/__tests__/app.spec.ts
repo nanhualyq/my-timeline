@@ -36,11 +36,19 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: async () => undefined }))
 
 let backend: FakeBackend;
 
-async function mountApp(options: { entries?: number; feeds?: number } = {}): Promise<VueWrapper> {
+async function mountApp(
+  options: { entries?: number; feeds?: number; view?: "all" | "unread" } = {},
+): Promise<VueWrapper> {
   backend = new FakeBackend(options);
   harness.backend = backend;
   const wrapper = mount(App);
   await flush();
+  if (options.view === "all") {
+    // Every list opens on the unread filter; specs that assert paging
+    // arithmetic over every stored entry ask for the All tab explicitly.
+    list(wrapper).vm.$emit("setView", "all");
+    await flush();
+  }
   return wrapper;
 }
 
@@ -80,7 +88,7 @@ afterEach(() => {
 
 describe("batch loading", () => {
   it("loads one bounded batch and reports progress", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    const wrapper = await mountApp({ entries: 120, feeds: 1, view: "all" });
 
     expect(rows(wrapper)).toHaveLength(50);
     expect(list(wrapper).props("hasMore")).toBe(true);
@@ -93,7 +101,7 @@ describe("batch loading", () => {
   });
 
   it("appends the next batch from the last loaded row with no gaps", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    const wrapper = await mountApp({ entries: 120, feeds: 1, view: "all" });
     const first = rows(wrapper);
 
     list(wrapper).vm.$emit("loadMore");
@@ -106,7 +114,8 @@ describe("batch loading", () => {
       Array.from({ length: 100 }, (_, i) => 120 - i),
     );
 
-    const second = listCalls()[1];
+    const calls = listCalls();
+    const second = calls[calls.length - 1];
     expect(second.args.after).toEqual({
       sort: first[49].sort_key,
       id: first[49].id,
@@ -114,7 +123,7 @@ describe("batch loading", () => {
   });
 
   it("does not ask for another batch once the list is exhausted", async () => {
-    const wrapper = await mountApp({ entries: 60, feeds: 1 });
+    const wrapper = await mountApp({ entries: 60, feeds: 1, view: "all" });
 
     list(wrapper).vm.$emit("loadMore");
     await flush();
@@ -128,7 +137,7 @@ describe("batch loading", () => {
   });
 
   it("treats an empty batch as the end without dropping what is loaded", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    const wrapper = await mountApp({ entries: 120, feeds: 1, view: "all" });
     expect(rows(wrapper)).toHaveLength(50);
 
     // Everything the cursor points at is deleted between batches.
@@ -149,7 +158,7 @@ describe("batch loading", () => {
 
 describe("selection and refresh", () => {
   it("discards an in-flight batch when the selection changes", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 2 });
+    const wrapper = await mountApp({ entries: 120, feeds: 2, view: "all" });
 
     // Put a batch of the current (global) selection in flight...
     const gate = backend.holdNext("list_entries");
@@ -172,7 +181,7 @@ describe("selection and refresh", () => {
   });
 
   it("re-reads the whole loaded window on refresh instead of one batch", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    const wrapper = await mountApp({ entries: 120, feeds: 1, view: "all" });
     list(wrapper).vm.$emit("loadMore");
     await flush();
     expect(rows(wrapper)).toHaveLength(100);
@@ -190,20 +199,21 @@ describe("selection and refresh", () => {
 
   it("reports the filtered total in the unread view", async () => {
     const wrapper = await mountApp({ entries: 120, feeds: 1 });
-    expect(list(wrapper).props("total")).toBe(120);
+    expect(list(wrapper).props("view"), "unread is the default").toBe("unread");
+    expect(list(wrapper).props("total"), "40 of 120 start read").toBe(80);
+    expect(rows(wrapper)).toHaveLength(50);
 
-    list(wrapper).vm.$emit("setView", "unread");
+    list(wrapper).vm.$emit("setView", "all");
     await flush();
 
-    expect(list(wrapper).props("view")).toBe("unread");
-    expect(list(wrapper).props("total"), "40 of 120 start read").toBe(80);
+    expect(list(wrapper).props("total")).toBe(120);
     expect(rows(wrapper)).toHaveLength(50);
   });
 });
 
 describe("reading pane", () => {
   it("keeps the open entry while further batches load", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    const wrapper = await mountApp({ entries: 120, feeds: 1, view: "all" });
     const open = rows(wrapper)[0];
 
     list(wrapper).vm.$emit("select", open);
@@ -257,7 +267,7 @@ describe("reading pane", () => {
 
 describe("progress", () => {
   it("counts loaded rows against the current view's total", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    const wrapper = await mountApp({ entries: 120, feeds: 1, view: "all" });
     expect(list(wrapper).props("viewedCount")).toBe(50);
 
     list(wrapper).vm.$emit("loadMore");
@@ -276,7 +286,7 @@ describe("progress", () => {
 
 describe("scope reset", () => {
   it("starts over at the newest batch when a feed is selected", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 2 });
+    const wrapper = await mountApp({ entries: 120, feeds: 2, view: "all" });
     list(wrapper).vm.$emit("loadMore");
     await flush();
     expect(rows(wrapper)).toHaveLength(100);
@@ -332,7 +342,7 @@ describe("batch read", () => {
   }
 
   it("is not offered in the unfiltered all-entries view", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    const wrapper = await mountApp({ entries: 120, feeds: 1, view: "all" });
     expect(list(wrapper).props("batchActionsAvailable")).toBe(false);
     expect(wrapper.find(".mark-rendered").exists()).toBe(false);
     expect(wrapper.find(".mark-above").exists()).toBe(false);
@@ -365,8 +375,12 @@ describe("batch read", () => {
     await flush();
 
     expect(backend.unreadFor(1)).toBe(80 - pageUnread);
-    // The page ends at id 71; older entries are untouched.
-    expect(backend.entries.find((e) => e.id === 70)?.is_read).toBe(false);
+    // Older entries the page never showed are untouched.
+    const olderThanPage = backend.entries.find(
+      (e) => e.id < page[page.length - 1].id && !e.is_read,
+    );
+    expect(olderThanPage, "the seed has unread entries below the page").toBeTruthy();
+    expect(olderThanPage!.is_read).toBe(false);
   });
 
   it("refills the unread page so the reader never has to scroll", async () => {
@@ -388,7 +402,7 @@ describe("batch read", () => {
   });
 
   it("leaves the row the action was used on, and everything below it, alone", async () => {
-    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    const wrapper = await mountApp({ entries: 120, feeds: 1, view: "all" });
     await openFeed(wrapper);
     const page = rows(wrapper);
     // Snapshot the flags: the app patches the same objects it renders.
@@ -524,5 +538,93 @@ describe("library-wide batch read", () => {
         .findAll(".row-menu-trigger")
         .some((b) => b.attributes("title") === "All entries actions"),
     ).toBe(false);
+  });
+});
+
+describe("list filter", () => {
+  function sidebar(wrapper: VueWrapper) {
+    return wrapper.findComponent(Sidebar);
+  }
+
+  it("opens on the unread filter", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    expect(list(wrapper).props("view")).toBe("unread");
+    expect(rows(wrapper).every((r) => !r.is_read)).toBe(true);
+    expect(list(wrapper).props("total"), "40 of 120 start read").toBe(80);
+  });
+
+  it("keeps the unread filter when a feed is selected", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 2 });
+    sidebar(wrapper).vm.$emit("select", { kind: "feed", id: 2 });
+    await flush();
+
+    expect(list(wrapper).props("view")).toBe("unread");
+    const loaded = rows(wrapper);
+    expect(loaded.length).toBeGreaterThan(0);
+    expect(loaded.every((r) => r.feed_id === 2 && !r.is_read)).toBe(true);
+  });
+
+  it("filters a folder to unread as well", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 2 });
+    backend.feeds[0].folder_id = 9;
+    backend.feeds[1].folder_id = 9;
+    wrapper
+      .findComponent(Sidebar)
+      .vm.$emit("select", { kind: "folder", id: 9 });
+    await flush();
+
+    const loaded = rows(wrapper);
+    expect(loaded.length).toBeGreaterThan(0);
+    expect(loaded.every((r) => !r.is_read)).toBe(true);
+  });
+
+  it("keeps the feed selected when the All tab is chosen inside it", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 2 });
+    sidebar(wrapper).vm.$emit("select", { kind: "feed", id: 2 });
+    await flush();
+
+    list(wrapper).vm.$emit("setView", "all");
+    await flush();
+
+    expect(list(wrapper).props("view")).toBe("all");
+    const loaded = rows(wrapper);
+    expect(loaded.every((r) => r.feed_id === 2), "still the feed's list").toBe(true);
+    expect(
+      loaded.some((r) => r.is_read),
+      "read entries are reachable from inside the feed",
+    ).toBe(true);
+    expect(sidebar(wrapper).props("selection")).toEqual({ kind: "feed", id: 2 });
+  });
+
+  it("carries the chosen filter over to the next selection", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 2 });
+    sidebar(wrapper).vm.$emit("select", { kind: "feed", id: 1 });
+    await flush();
+    list(wrapper).vm.$emit("setView", "all");
+    await flush();
+
+    sidebar(wrapper).vm.$emit("select", { kind: "feed", id: 2 });
+    await flush();
+
+    expect(list(wrapper).props("view")).toBe("all");
+    expect(
+      rows(wrapper).some((r) => r.is_read),
+      "the archive view carried over",
+    ).toBe(true);
+  });
+
+  it("shows every starred entry whatever the filter is", async () => {
+    const wrapper = await mountApp({ entries: 120, feeds: 1 });
+    backend.entries.forEach((e, i) => {
+      e.is_starred = i % 4 === 0;
+    });
+
+    sidebar(wrapper).vm.$emit("select", { kind: "starred" });
+    await flush();
+
+    expect(list(wrapper).props("view")).toBe("all");
+    expect(list(wrapper).props("unreadFilterAvailable")).toBe(false);
+    expect(wrapper.findAll(".view-tabs button"), "no unread tab").toHaveLength(1);
+    expect(rows(wrapper).some((r) => r.is_read)).toBe(true);
   });
 });
