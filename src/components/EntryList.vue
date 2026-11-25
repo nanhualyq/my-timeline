@@ -46,6 +46,40 @@ let observer: IntersectionObserver | null = null;
 let clock: ReturnType<typeof setInterval> | null = null;
 
 /**
+ * Keep the cursor row inside the scroll port. The list does not decide where
+ * the cursor is; it only makes the row the container chose visible.
+ */
+function revealCursor(id: number | null) {
+  if (id === null) return;
+  const row = listEl.value?.querySelector<HTMLElement>(
+    `.entry[data-entry-id="${id}"]`,
+  );
+  // jsdom has no scrollIntoView; the guard keeps the render path safe there.
+  row?.scrollIntoView?.({ block: "nearest" });
+}
+
+// After the render, so the row exists when a jump appends new rows.
+watch(() => props.selectedEntryId, revealCursor, { flush: "post" });
+
+/**
+ * Rows that fit in the list box. Measured from a rendered row rather than from
+ * the row height in the stylesheet, so the stylesheet stays the only place
+ * that height is defined.
+ */
+function visibleRowCount(): number {
+  const box = listEl.value;
+  const row = box?.querySelector<HTMLElement>(".entry");
+  if (!box || !row) return 0;
+  const rowHeight = row.offsetHeight;
+  if (rowHeight <= 0) return 0;
+  return Math.max(1, Math.floor(box.clientHeight / rowHeight));
+}
+
+// The container drives movement, so it needs the one measurement only this
+// component can take.
+defineExpose({ visibleRowCount });
+
+/**
  * Clock the relative labels read from. One minute is the finest bucket the
  * labels distinguish, so that is how often the list re-renders them; without
  * this a list left open would keep claiming an entry is "5m" old.
@@ -79,11 +113,17 @@ onMounted(() => {
 // An observer only reports crossings, so after a batch lands it would stay
 // silent while the sentinel is still on screen. Ask again instead of
 // stalling — the list keeps growing until the sentinel scrolls away.
+//
+// Post-flush, deliberately: the measurement has to see the rows that just
+// landed. Measured before the re-render, the sentinel still looks on screen
+// because the appended rows are not in the DOM yet, and one trigger becomes two
+// batches — a single `G` would grow the list by 100 rows instead of 50.
 watch(
   () => props.loadingMore,
   (loading) => {
     if (!loading && props.hasMore && sentinelVisible()) emit("loadMore");
   },
+  { flush: "post" },
 );
 
 onBeforeUnmount(() => {
@@ -181,6 +221,7 @@ function unreadAbove(index: number): number {
       <li
         v-for="(entry, index) in entries"
         :key="entry.id"
+        :data-entry-id="entry.id"
         class="entry"
         :class="{ active: entry.id === selectedEntryId, unread: !entry.is_read }"
         @click="emit('select', entry)"

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { addFeed, createFolder, exportOpml, importOpml } from "../api";
+import { blockKeyboard } from "../lib/keyboard-blocks";
 import { open, save } from "@tauri-apps/plugin-dialog";
 
 defineProps<{
@@ -109,8 +110,15 @@ function onKey(event: KeyboardEvent) {
   if (event.key === "Escape") emit("close");
 }
 
+// While the dialog is open the container must not act on keystrokes meant for
+// the fields inside it.
+const releaseKeyboard = blockKeyboard();
+
 onMounted(() => document.addEventListener("keydown", onKey));
-onBeforeUnmount(() => document.removeEventListener("keydown", onKey));
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", onKey);
+  releaseKeyboard();
+});
 </script>
 
 <template>

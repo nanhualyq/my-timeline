@@ -1,10 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import Sidebar from "./components/Sidebar.vue";
 import EntryList from "./components/EntryList.vue";
 import ReadingPane from "./components/ReadingPane.vue";
 import FeedEditDialog from "./components/FeedEditDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
+import KeyboardHelp from "./components/KeyboardHelp.vue";
+import {
+  EMPTY_KEY_STATE,
+  isEditableTarget,
+  isSuppressed,
+  resolve,
+  toKeystroke,
+  tokenOf,
+  type Action,
+  type KeyState,
+} from "./lib/keymap";
+import { keyboardBlocked } from "./lib/keyboard-blocks";
 import {
   listFeeds,
   listFolders,
@@ -36,6 +48,14 @@ import { message } from "@tauri-apps/plugin-dialog";
  *  batch size is not worth adding one for. */
 const PAGE_SIZE = 50;
 
+/** How long a burst of cursor moves keeps accumulating before it is written.
+ *  Below a typical key-repeat interval, so releasing the key lands the write
+ *  immediately, and above the gap between two deliberate presses. */
+const BURST_FLUSH_MS = 120;
+
+/** How long a `g` waits for its second key before it is forgotten. */
+const PREFIX_TIMEOUT_MS = 1000;
+
 const feeds = ref<Feed[]>([]);
 const folders = ref<Folder[]>([]);
 /** Everything loaded so far — grows one batch at a time, never all at once. */
@@ -64,6 +84,28 @@ const busy = ref(false);
 const loadError = ref<string | null>(null);
 const editingFeed = ref<Feed | null>(null);
 const settingsOpen = ref(false);
+const helpOpen = ref(false);
+
+/** The list and the pane lend the container what only they can measure or
+ *  scroll; neither decides where the cursor is. */
+const listRef = ref<InstanceType<typeof EntryList> | null>(null);
+const paneRef = ref<InstanceType<typeof ReadingPane> | null>(null);
+
+/** Where the cursor was, used only when its entry has left the list and a
+ *  position has to stand in for an identity. */
+const lastCursorIndex = ref(0);
+
+/** Pending keys: a count, and the first key of a sequence waiting for its
+ *  second. Reset by `resolve`. */
+let keyState: KeyState = EMPTY_KEY_STATE;
+let prefixTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** The burst: the row the cursor settled on, and every row it landed on. */
+let pendingOpenId: number | null = null;
+const pendingReadIds = new Set<number>();
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+/** Rows to advance once the batch the cursor walked off has landed. */
+let pendingAdvance = 0;
 
 // The two modals are mutually exclusive — never stack them.
 function openSettings() {
@@ -197,12 +239,21 @@ async function reload() {
     // triggered this reload may have changed it (a whole-feed batch mark from
     // the sidebar, a refresh, or its feed being removed). Re-read that one row
     // rather than letting the reading pane's toggle go stale.
+    trackCursor();
     if (selectedEntryId.value !== null) {
       const id = selectedEntryId.value;
       const full = await getEntry(id);
       if (selectedEntryId.value === id) {
         selectedEntry.value = full;
-        if (full === null) selectedEntryId.value = null;
+        if (full === null) {
+          // The entry no longer exists (its feed was removed): the cursor
+          // stands in at the position it held, and the pane loads that row.
+          replaceVanishedCursor();
+          const replacement = selectedEntryId.value;
+          if (replacement !== null) {
+            selectedEntry.value = await getEntry(replacement);
+          }
+        }
       }
     }
     loadError.value = null;
@@ -213,16 +264,24 @@ async function reload() {
 
 /** Any change of view or scope starts over from the newest batch. */
 function startOver() {
+  // Whatever the cursor did before this keypress belongs to the list that is
+  // about to be replaced; write it before that list is gone.
+  void flushBurst();
   generation += 1;
   entries.value = [];
   after.value = null;
   hasMore.value = false;
+  pendingAdvance = 0;
   void reload();
 }
 
 /** Append the next batch. The scroll sentinel asks; this decides. */
 async function loadMore() {
-  if (!hasMore.value || loadingMore.value || entries.value.length === 0) return;
+  if (!hasMore.value || loadingMore.value || entries.value.length === 0) {
+    // Nothing will be appended, so a pending carry-over has nothing to land on.
+    pendingAdvance = 0;
+    return;
+  }
   const gen = generation;
   loadingMore.value = true;
   try {
@@ -233,10 +292,14 @@ async function loadMore() {
     if (items.length === 0) {
       // Everything after the cursor was deleted: stop rather than spin.
       hasMore.value = false;
+      pendingAdvance = 0;
     } else {
       entries.value.push(...items);
       after.value = cursorOfLast(items);
       hasMore.value = rows.length > PAGE_SIZE;
+      trackCursor();
+      // A move that walked off the old last row continues here.
+      settleAdvance();
     }
     loadError.value = null;
   } catch (e) {
@@ -250,6 +313,7 @@ function select(sel: Selection) {
   selection.value = sel;
   selectedEntryId.value = null;
   selectedEntry.value = null;
+  lastCursorIndex.value = 0;
   startOver();
 }
 
@@ -295,7 +359,7 @@ function patchEntry(
   if (selectedEntry.value?.id === id) Object.assign(selectedEntry.value, patch);
 }
 
-async function applyRead(entry: Entry, isRead: boolean) {
+async function applyRead(entry: { id: number }, isRead: boolean) {
   try {
     await setRead(entry.id, isRead);
     patchEntry(entry.id, { is_read: isRead });
@@ -311,8 +375,24 @@ function toggleRead() {
   if (entry) void applyRead(entry, !entry.is_read);
 }
 
-/** Mark every unread row the list is showing. Ids always come from rows that
- *  are on screen, so a batch can never reach an entry the reader has not seen. */
+/**
+ * Mark rows read without touching the loaded rows.
+ *
+ * The difference from `applyBatchRead` is the point: a batch action refills an
+ * unread list, while these rows were marked because the cursor moved onto them.
+ * Resetting here would move the list under the cursor on every keystroke.
+ */
+async function applyReadSilently(ids: number[]) {
+  if (ids.length === 0) return;
+  try {
+    await markReadMany(ids);
+    for (const id of ids) patchEntry(id, { is_read: true });
+    await refreshCounts();
+  } catch (e) {
+    loadError.value = String(e);
+  }
+}
+
 function markRenderedRead() {
   void applyBatchRead(
     entries.value.filter((e) => !e.is_read).map((e) => e.id),
@@ -436,7 +516,319 @@ async function openLink(url: string) {
   }
 }
 
-onMounted(reload);
+/* --- Keyboard ------------------------------------------------------------ */
+
+/** The row the cursor is on. The cursor *is* the open entry: there is no
+ *  second piece of state that could point at a different row. */
+function cursorRow(): EntryListItem | null {
+  const id = selectedEntryId.value;
+  if (id === null) return null;
+  return entries.value.find((row) => row.id === id) ?? null;
+}
+
+function cursorIndex(): number {
+  const id = selectedEntryId.value;
+  return id === null ? -1 : entries.value.findIndex((row) => row.id === id);
+}
+
+/**
+ * Open a row because the cursor landed on it.
+ *
+ * The row is marked read in the list immediately — a keystroke must not wait
+ * for a request — while the write itself is coalesced with the rest of the
+ * burst. That is what keeps holding `j` from becoming one write per repeat.
+ */
+function openAtCursor(index: number) {
+  const row = entries.value[index];
+  if (!row) return;
+  lastCursorIndex.value = index;
+  if (row.id === selectedEntryId.value) return;
+  selectedEntryId.value = row.id;
+  // The previous article stays on screen until the new one lands: blanking the
+  // pane on every keystroke of a burst would only flicker. The flush keeps the
+  // stale-response guard, so a late reply for an abandoned row is dropped.
+  if (!row.is_read) {
+    row.is_read = true;
+    pendingReadIds.add(row.id);
+  }
+  pendingOpenId = row.id;
+  armFlush();
+}
+
+/**
+ * Keep the cursor's recorded position current as rows are added above or
+ * removed from the list. It never decides that the cursor is gone: only
+ * `reload` learns that, by asking the backend for the entry itself.
+ */
+function trackCursor() {
+  const index = cursorIndex();
+  if (index >= 0) lastCursorIndex.value = index;
+}
+
+/** Stand in for an entry that no longer exists, at the position it held. */
+function replaceVanishedCursor() {
+  if (entries.value.length === 0) {
+    selectedEntryId.value = null;
+    selectedEntry.value = null;
+    return;
+  }
+  const fallback = Math.min(lastCursorIndex.value, entries.value.length - 1);
+  selectedEntryId.value = entries.value[fallback].id;
+  lastCursorIndex.value = fallback;
+}
+
+/** Move the cursor by `delta` rows, or stop at the ends. */
+async function stepCursor(delta: number) {
+  if (entries.value.length === 0) return;
+  const from = cursorIndex();
+  const base = from < 0 ? (delta > 0 ? -1 : 0) : from;
+  const target = base + delta;
+  if (target < 0) return;
+  const last = entries.value.length - 1;
+  if (target > last) {
+    // Walked off the loaded rows with more to come: continue on the next batch
+    // rather than dropping the keypress.
+    if (delta > 0 && hasMore.value) {
+      pendingAdvance = 1;
+      await loadMore();
+      return;
+    }
+    // A counted move stops at the end; a single step at the end stays put.
+    if (Math.abs(delta) > 1) openAtCursor(last);
+    return;
+  }
+  openAtCursor(target);
+}
+
+/** `G`: a numbered row when counted, otherwise the end of the loaded rows.
+ *
+ * One batch per press, deliberately. The list is keyset-paginated, so there is
+ * no way to reach a distant last row except by walking every batch between
+ * here and there; loading them all on one keypress would leave the cursor
+ * parked while hundreds of round trips run. The first press lands on the end
+ * the reader can actually see, and each further press extends it.
+ */
+async function jumpToBottom(row: number | null) {
+  if (row !== null) {
+    if (entries.value.length === 0) return;
+    openAtCursor(Math.min(row - 1, entries.value.length - 1));
+    return;
+  }
+  if (entries.value.length === 0) return;
+  const last = entries.value.length - 1;
+  if (cursorIndex() !== last) {
+    openAtCursor(last);
+    return;
+  }
+  // Already at the end: one more batch, then the new end of the list.
+  if (!hasMore.value) return;
+  await loadMore();
+  if (entries.value.length > last + 1) openAtCursor(entries.value.length - 1);
+}
+
+/** Continue a move that walked off the loaded rows. */
+function settleAdvance() {
+  if (pendingAdvance === 0) return;
+  const advance = pendingAdvance;
+  pendingAdvance = 0;
+  const index = cursorIndex();
+  if (index < 0) return;
+  const target = Math.min(index + advance, entries.value.length - 1);
+  if (target !== index) openAtCursor(target);
+}
+
+/** Half a screen of rows, measured by the list. A list that has not been laid
+ *  out yet — a keypress before first layout — still has to move somewhere. */
+function halfPageSize(): number {
+  const visible = listRef.value?.visibleRowCount() ?? 0;
+  return Math.max(1, Math.floor((visible > 0 ? visible : 20) / 2));
+}
+
+/** Write what a burst of moves did: one content fetch for the row the cursor
+ *  settled on, one write for every row it landed on, one count refresh. */
+async function flushBurst() {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  const openId = pendingOpenId;
+  pendingOpenId = null;
+  const ids = [...pendingReadIds];
+  pendingReadIds.clear();
+
+  if (openId !== null && openId === selectedEntryId.value) {
+    try {
+      const full = await getEntry(openId);
+      // A newer move already replaced this row.
+      if (selectedEntryId.value === openId) selectedEntry.value = full;
+    } catch (e) {
+      loadError.value = String(e);
+    }
+  }
+  await applyReadSilently(ids);
+}
+
+function armFlush() {
+  if (flushTimer !== null) clearTimeout(flushTimer);
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    void flushBurst();
+  }, BURST_FLUSH_MS);
+}
+
+/** Run an action that writes right away, once the cursor's burst is written:
+ *  a pending mark landing afterwards would undo the action. */
+async function afterBurst(fn: () => void | Promise<void>) {
+  await flushBurst();
+  await fn();
+}
+
+function toggleReadAtCursor() {
+  const row = cursorRow();
+  if (row) return applyRead(row, !row.is_read);
+}
+
+function toggleStarAtCursor() {
+  const row = cursorRow();
+  if (row) return toggleStar(row);
+}
+
+function openLinkAtCursor() {
+  const row = cursorRow();
+  if (row?.link) return openLink(row.link);
+}
+
+function runAction(action: Action, count: number | null) {
+  const steps = count ?? 1;
+  switch (action) {
+    case "cursor-down":
+      void stepCursor(steps);
+      return;
+    case "cursor-up":
+      void stepCursor(-steps);
+      return;
+    case "cursor-top":
+      if (entries.value.length > 0) openAtCursor(0);
+      return;
+    case "cursor-bottom":
+      void jumpToBottom(count);
+      return;
+    case "half-page-down":
+      void stepCursor(halfPageSize() * steps);
+      return;
+    case "half-page-up":
+      void stepCursor(-halfPageSize() * steps);
+      return;
+    case "pane-scroll-down":
+      paneRef.value?.scrollByScreens(steps);
+      return;
+    case "pane-scroll-up":
+      paneRef.value?.scrollByScreens(-steps);
+      return;
+    case "toggle-help":
+      helpOpen.value = true;
+      return;
+    case "toggle-read":
+      void afterBurst(toggleReadAtCursor);
+      return;
+    case "toggle-star":
+      void afterBurst(toggleStarAtCursor);
+      return;
+    case "open-link":
+      void afterBurst(openLinkAtCursor);
+      return;
+    case "toggle-view":
+      // The starred view has no filter; `setView` already ignores it there.
+      setView(displayView.value === "unread" ? "all" : "unread");
+      return;
+    case "mark-rendered":
+      void afterBurst(() => markRenderedRead());
+      return;
+    case "refresh-all":
+      void afterBurst(doRefreshAll);
+      return;
+    case "go-all":
+      select({ kind: "all" });
+      return;
+    case "go-starred":
+      select({ kind: "starred" });
+      return;
+  }
+}
+
+function clearPrefixTimer() {
+  if (prefixTimer !== null) {
+    clearTimeout(prefixTimer);
+    prefixTimer = null;
+  }
+}
+
+/** A `g` that never completes is forgotten, and is never re-read as a command
+ *  of its own: nothing is bound to a bare `g`. */
+function armPrefixTimer() {
+  clearPrefixTimer();
+  prefixTimer = setTimeout(() => {
+    prefixTimer = null;
+    keyState = EMPTY_KEY_STATE;
+  }, PREFIX_TIMEOUT_MS);
+}
+
+function onKeydown(event: KeyboardEvent) {
+  const stroke = toKeystroke(event);
+  const editable = isEditableTarget(event.target);
+
+  if (isSuppressed(stroke, { blocked: keyboardBlocked.value, editable })) {
+    // The help overlay holds the keyboard like a dialog, so it is also the one
+    // blocked surface a key closes.
+    if (
+      helpOpen.value &&
+      !editable &&
+      (stroke.key === "Escape" || stroke.key === "?")
+    ) {
+      event.preventDefault();
+      helpOpen.value = false;
+    }
+    return;
+  }
+
+  const token = tokenOf(stroke);
+  if (token === null) return;
+
+  const resolution = resolve(keyState, token);
+  keyState = resolution.state;
+
+  if (resolution.kind === "pending") {
+    armPrefixTimer();
+    return;
+  }
+  clearPrefixTimer();
+  if (resolution.kind === "ignored") return;
+
+  // The key is ours, so the webview must not also act on it.
+  event.preventDefault();
+  runAction(resolution.action, resolution.count);
+}
+
+/** A pending write must not wait for the reader to do something else. */
+function flushOnLeave() {
+  void flushBurst();
+}
+
+onMounted(() => {
+  void reload();
+  document.addEventListener("keydown", onKeydown);
+  window.addEventListener("blur", flushOnLeave);
+  window.addEventListener("beforeunload", flushOnLeave);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("blur", flushOnLeave);
+  window.removeEventListener("beforeunload", flushOnLeave);
+  clearPrefixTimer();
+  void flushBurst();
+});
+
 </script>
 
 <template>
@@ -459,6 +851,7 @@ onMounted(reload);
       @open-settings="openSettings"
     />
     <EntryList
+      ref="listRef"
       :entries="entries"
       :selected-entry-id="selectedEntryId"
       :view="displayView"
@@ -480,6 +873,7 @@ onMounted(reload);
       @mark-above="markAboveRead"
     />
     <ReadingPane
+      ref="paneRef"
       :entry="selectedEntry"
       :feed="selectedFeed"
       @toggle-read="toggleRead"
@@ -498,6 +892,7 @@ onMounted(reload);
       @close="settingsOpen = false"
       @changed="reload"
     />
+    <KeyboardHelp v-if="helpOpen" @close="helpOpen = false" />
   </main>
 </template>
 

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { blockKeyboard } from "../lib/keyboard-blocks";
 
 /** A single dropdown menu entry. */
 interface RowMenuItem {
@@ -45,9 +46,23 @@ onMounted(() => {
   document.addEventListener("keydown", onDocumentKey);
 });
 
+// An open menu owns the keyboard: the container must not move the entry cursor
+// behind it. The menu keeps its own Escape handling.
+let releaseKeyboard: (() => void) | null = null;
+watch(open, (isOpen) => {
+  if (isOpen && !releaseKeyboard) {
+    releaseKeyboard = blockKeyboard();
+  } else if (!isOpen && releaseKeyboard) {
+    releaseKeyboard();
+    releaseKeyboard = null;
+  }
+});
+
 onBeforeUnmount(() => {
   document.removeEventListener("click", onDocumentClick);
   document.removeEventListener("keydown", onDocumentKey);
+  releaseKeyboard?.();
+  releaseKeyboard = null;
 });
 </script>
 

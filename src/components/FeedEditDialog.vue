@@ -6,6 +6,7 @@ import {
   type Feed,
   type Folder,
 } from "../api";
+import { blockKeyboard } from "../lib/keyboard-blocks";
 
 const props = defineProps<{
   feed: Feed;
@@ -60,8 +61,15 @@ function onKey(event: KeyboardEvent) {
   if (event.key === "Escape") emit("close");
 }
 
+// While the dialog is open the container must not act on keystrokes meant for
+// the fields inside it.
+const releaseKeyboard = blockKeyboard();
+
 onMounted(() => document.addEventListener("keydown", onKey));
-onBeforeUnmount(() => document.removeEventListener("keydown", onKey));
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", onKey);
+  releaseKeyboard();
+});
 </script>
 
 <template>

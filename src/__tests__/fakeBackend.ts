@@ -245,6 +245,54 @@ export function stubScrollGeometry(sentinelVisible: boolean): void {
   );
 }
 
+/**
+ * Geometry for a list that actually grows: the sentinel sits immediately after
+ * the last rendered row, and revealing the last row scrolls the box to its
+ * bottom. `stubScrollGeometry` cannot express that — it pins the sentinel to a
+ * fixed rect, so the sentinel never leaves the box as rows are appended, and a
+ * bug that asks for another batch before the appended rows are laid out stays
+ * invisible.
+ */
+export function stubGrowingListGeometry(
+  options: { rowHeight?: number; boxHeight?: number } = {},
+): void {
+  const rowHeight = options.rowHeight ?? 120;
+  const boxHeight = options.boxHeight ?? 600;
+  let scrollTop = 0;
+
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(
+    function (this: Element): DOMRect {
+      const rect = (top: number, bottom: number): DOMRect =>
+        ({
+          top,
+          bottom,
+          left: 0,
+          right: 100,
+          width: 100,
+          height: bottom - top,
+          x: 0,
+          y: top,
+          toJSON: () => ({}),
+        }) as DOMRect;
+      if (this.classList?.contains("sentinel")) {
+        const rows = document.querySelectorAll(".entry").length;
+        const top = rows * rowHeight - scrollTop;
+        return rect(top, top + 20);
+      }
+      return rect(0, boxHeight);
+    },
+  );
+
+  Object.defineProperty(Element.prototype, "scrollIntoView", {
+    value: () => {
+      const rows = document.querySelectorAll(".entry").length;
+      scrollTop = Math.max(0, rows * rowHeight - boxHeight);
+    },
+    writable: true,
+    configurable: true,
+  });
+}
+
 /** An `IntersectionObserver` that records itself so tests can fire it. */
 export class FakeIntersectionObserver {
   static instances: FakeIntersectionObserver[] = [];

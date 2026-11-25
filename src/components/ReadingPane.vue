@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { ref, watch } from "vue";
 import type { Entry, Feed } from "../api";
 
-defineProps<{
+const props = defineProps<{
   entry: Entry | null;
   feed: Feed | null;
 }>();
@@ -10,6 +11,28 @@ const emit = defineEmits<{
   toggleRead: [];
   openLink: [url: string];
 }>();
+
+const contentEl = ref<HTMLElement | null>(null);
+
+/** Scroll the article by whole screens. The keys belong to the container, so
+ *  this is a plain method it calls rather than a listener of our own. */
+function scrollByScreens(screens: number) {
+  const el = contentEl.value;
+  if (!el) return;
+  el.scrollTop += screens * el.clientHeight;
+}
+
+// A new entry starts at its beginning. Post-render, so the measurement is of
+// the content that just landed.
+watch(
+  () => props.entry?.id,
+  () => {
+    if (contentEl.value) contentEl.value.scrollTop = 0;
+  },
+  { flush: "post" },
+);
+
+defineExpose({ scrollByScreens });
 </script>
 
 <template>
@@ -42,7 +65,7 @@ const emit = defineEmits<{
         </div>
       </header>
       <!-- content_html is sanitized with ammonia in the Rust backend before storage -->
-      <article class="content" v-html="entry.content_html"></article>
+      <article ref="contentEl" class="content" v-html="entry.content_html"></article>
     </template>
     <p v-else class="placeholder">Select an entry to read.</p>
   </section>
