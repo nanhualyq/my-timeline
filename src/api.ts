@@ -177,6 +177,8 @@ export interface ImportOutcome {
 
 export interface ExportOutcome {
   feeds_exported: number;
+  /** The rendered document; the frontend writes it where the picker pointed. */
+  xml: string;
 }
 
 export function createFolder(name: string): Promise<Folder> {
@@ -207,11 +209,12 @@ export function setFeedTitle(
   return invoke("set_feed_title", { feedId, title });
 }
 
-/** Import an OPML file. Merge-only; does not fetch any feed. */
-export function importOpml(path: string): Promise<ImportOutcome> {
-  return invoke("import_opml", { path });
+/** Import OPML text. Merge-only; does not fetch any feed. */
+export function importOpml(xml: string): Promise<ImportOutcome> {
+  return invoke("import_opml", { xml });
 }
 
-export function exportOpml(path: string): Promise<ExportOutcome> {
-  return invoke("export_opml", { path });
+/** Render every subscription as OPML text and report how many were written. */
+export function exportOpml(): Promise<ExportOutcome> {
+  return invoke("export_opml");
 }

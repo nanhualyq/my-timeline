@@ -133,6 +133,10 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* Phone-sized: the dialog must never be pushed past the viewport edges by
+     its own height or by a raised on-screen keyboard. */
+  padding: 1rem;
+  box-sizing: border-box;
 }
 .dialog {
   background: #fff;
@@ -143,6 +147,10 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 0.7rem;
+  /* Tall content scrolls inside the dialog instead of clipping its actions. */
+  max-height: 100%;
+  overflow-y: auto;
+  box-sizing: border-box;
 }
 .dialog-title {
   margin: 0;

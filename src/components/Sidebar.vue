@@ -21,6 +21,9 @@ const props = defineProps<{
   starredCount: number;
   /** Unread entries across the whole library, for the global batch action. */
   unreadCount: number;
+  /** True on the one-pane layout, where this component is an overlay drawer
+   *  and its controls have to be sized for a fingertip. */
+  narrow?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -172,6 +175,7 @@ const items = computed<SidebarItem[]>(() => {
       type="button"
       class="settings-btn"
       title="Settings"
+      aria-label="Settings"
       @click="emit('openSettings')"
     >
       <span aria-hidden="true">&#9881;</span>
@@ -195,6 +199,7 @@ const items = computed<SidebarItem[]>(() => {
           v-if="unreadCount > 0"
           :items="globalMenuItems()"
           trigger-title="All entries actions"
+          :touch="props.narrow === true"
           :disabled="busy"
           @select="onGlobalMenu"
         />
@@ -234,6 +239,7 @@ const items = computed<SidebarItem[]>(() => {
                 ? 'Collapse folder'
                 : 'Expand folder'
             "
+            :class="{ 'touch-target': props.narrow }"
             @click.stop="toggleFolder(item.folder.id)"
           >
             <span class="caret" aria-hidden="true">&#9656;</span>
@@ -255,6 +261,7 @@ const items = computed<SidebarItem[]>(() => {
           <RowMenu
             :items="folderMenuItems(item.folder)"
             trigger-title="Folder actions"
+            :touch="props.narrow === true"
             :disabled="busy"
             @select="(key) => onFolderMenu(key, item.folder)"
           />
@@ -282,6 +289,7 @@ const items = computed<SidebarItem[]>(() => {
           <RowMenu
             :items="feedMenuItems(item.feed)"
             trigger-title="Feed actions"
+            :touch="props.narrow === true"
             :disabled="busy"
             @select="(key) => onFeedMenu(key, item.feed)"
           />
@@ -319,8 +327,16 @@ const items = computed<SidebarItem[]>(() => {
   font-size: 0.85rem;
   text-align: left;
 }
-.settings-btn:hover {
+.settings-btn:active {
   background: #eaeaea;
+}
+@media (hover: hover) and (pointer: fine) {
+  .settings-btn:hover {
+    background: #eaeaea;
+  }
+}
+.feed-item:active {
+  background: #e6ebf2;
 }
 .error {
   color: #c0392b;
@@ -374,9 +390,11 @@ const items = computed<SidebarItem[]>(() => {
   border-radius: 4px;
   padding: 0;
 }
-.folder-toggle:hover {
-  background: #eee;
-  color: #000;
+@media (hover: hover) and (pointer: fine) {
+  .folder-toggle:hover {
+    background: #eee;
+    color: #000;
+  }
 }
 .folder-toggle .caret {
   display: inline-block;
@@ -400,8 +418,10 @@ const items = computed<SidebarItem[]>(() => {
   cursor: pointer;
   min-width: 0;
 }
-.feed-item:hover {
-  background: #eee;
+@media (hover: hover) and (pointer: fine) {
+  .feed-item:hover {
+    background: #eee;
+  }
 }
 .feed-item.global .feed-title {
   font-weight: 600;
@@ -423,6 +443,11 @@ const items = computed<SidebarItem[]>(() => {
 .feed-item:hover .unread-badge:not(.starred),
 .feed-item.active .unread-badge:not(.starred) {
   color: #8f8f8f;
+}
+@media (hover: none) {
+  .feed-item:hover .unread-badge:not(.starred) {
+    color: #a3a3a3;
+  }
 }
 .unread-badge.starred {
   background: #2d7ff9;

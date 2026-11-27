@@ -26,6 +26,27 @@ pub struct ParsedEntry {
     pub published_at: Option<String>,
 }
 
+/// Render an error and everything it was caused by, outermost first.
+///
+/// `reqwest::Error`'s own `Display` says only "error sending request for url
+/// (…)", which is the same sentence for a DNS failure, a refused connection,
+/// a TLS rejection, and a timeout. The causes beneath it are the part that
+/// says which of those happened, and they are what gets stored on the feed and
+/// shown to the reader, so they are kept.
+fn describe(error: &dyn std::error::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // Skip a cause that only repeats its parent.
+        if parts.last().map(|last| last != &text).unwrap_or(true) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    parts.join(": ")
+}
+
 /// Fetch a URL and return its bytes plus the final URL after redirects.
 pub async fn fetch_bytes(url: &str) -> Result<(Vec<u8>, String), String> {
     let client = reqwest::Client::builder()
@@ -37,7 +58,7 @@ pub async fn fetch_bytes(url: &str) -> Result<(Vec<u8>, String), String> {
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(|e| format!("request failed: {}", describe(&e)))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("HTTP {status}"));
@@ -46,7 +67,7 @@ pub async fn fetch_bytes(url: &str) -> Result<(Vec<u8>, String), String> {
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| format!("read body failed: {e}"))?
+        .map_err(|e| format!("read body failed: {}", describe(&e)))?
         .to_vec();
     Ok((bytes, final_url))
 }
@@ -303,5 +324,55 @@ mod tests {
         assert_eq!(feeds.len(), 1);
         assert_eq!(feeds[0].id, id);
         assert_eq!(feeds[0].title, "Fixture Feed");
+    }
+
+    /// `describe` exists because reqwest's top-level message is the same for
+    /// every transport failure; the causes are what identify the failure.
+    #[test]
+    fn describe_keeps_the_cause_chain() {
+        #[derive(Debug)]
+        struct Cause(&'static str, Option<Box<Cause>>);
+        impl std::fmt::Display for Cause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for Cause {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|c| c as &dyn std::error::Error)
+            }
+        }
+
+        let error = Cause(
+            "request failed",
+            Some(Box::new(Cause(
+                "error sending request for url (https://example.test/feed)",
+                Some(Box::new(Cause("dns error", Some(Box::new(Cause("failed to lookup address information: Name or service not known", None)))))),
+            ))),
+        );
+
+        let described = describe(&error);
+        assert!(described.starts_with("request failed: "));
+        assert!(described.contains("dns error"), "got: {described}");
+        assert!(
+            described.contains("failed to lookup address information"),
+            "got: {described}"
+        );
+    }
+
+    /// A cause that only repeats its parent is not printed twice.
+    #[test]
+    fn describe_does_not_repeat_itself() {
+        #[derive(Debug)]
+        struct Same;
+        impl std::fmt::Display for Same {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "same text")
+            }
+        }
+        impl std::error::Error for Same {}
+
+        let error = Same;
+        assert_eq!(describe(&error), "same text");
     }
 }

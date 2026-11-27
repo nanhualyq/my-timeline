@@ -23,9 +23,12 @@ pub struct Exported {
     pub feeds_exported: i64,
 }
 
-/// Serializable result of an export.
+/// Serializable result of an export: the rendered document, so the frontend
+/// owns the platform-specific way of writing it (a filesystem path on desktop,
+/// a document reference on Android).
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportOutcome {
+    pub xml: String,
     pub feeds_exported: i64,
 }
 

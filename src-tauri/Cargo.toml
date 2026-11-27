@@ -36,6 +36,9 @@ futures = "0.3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-dialog = "2"
+# OPML import/export: the frontend reads and writes the picked file, so the
+# same commands work with a desktop path and an Android document reference.
+tauri-plugin-fs = "2"
 roxmltree = "0.21.2"
 
 

@@ -15,6 +15,9 @@ const props = defineProps<{
   /** Accessible title for the ⋮ trigger button. */
   triggerTitle: string;
   disabled?: boolean;
+  /** True on a touch layout: the trigger is sized for a fingertip and the
+   *  menu has no hover to rely on. */
+  touch?: boolean;
 }>();
 
 const emit = defineEmits<{ select: [key: string] }>();
@@ -71,7 +74,9 @@ onBeforeUnmount(() => {
     <button
       type="button"
       class="row-menu-trigger"
+      :class="{ 'touch-target': props.touch }"
       :title="triggerTitle"
+      :aria-label="triggerTitle"
       :disabled="disabled"
       aria-haspopup="menu"
       :aria-expanded="open"
@@ -115,6 +120,16 @@ onBeforeUnmount(() => {
   background: #ddd;
   color: #000;
 }
+@media (hover: none) {
+  /* No pointer to hover with: a tap must not leave the trigger hovered. */
+  .row-menu-trigger:hover:not(:disabled) {
+    background: transparent;
+    color: #666;
+  }
+  .row-menu-trigger:active {
+    background: #ddd;
+  }
+}
 .row-menu-trigger:disabled {
   opacity: 0.35;
   cursor: default;
@@ -145,6 +160,14 @@ onBeforeUnmount(() => {
 }
 .row-menu-item:hover {
   background: #eee;
+}
+@media (hover: none) {
+  .row-menu-item:hover {
+    background: transparent;
+  }
+  .row-menu-item:active {
+    background: #e6ebf2;
+  }
 }
 .row-menu-item.danger {
   color: #c0392b;

@@ -25,6 +25,9 @@ const props = defineProps<{
   /** True when the current list is a triage queue (a feed, a folder, or the
    *  global unread view), where batch marking belongs. */
   batchActionsAvailable: boolean;
+  /** True on the one-pane layout: the header hosts the drawer toggle and the
+   *  row controls stop depending on hover. */
+  narrow: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -37,6 +40,8 @@ const emit = defineEmits<{
   markRendered: [];
   /** Mark the unread rows above the row at this index, excluding that row. */
   markAbove: [index: number];
+  /** Narrow layout only: the reader wants the feed drawer. */
+  openNav: [];
 }>();
 
 /** The scrolling list and the row at its end that asks for another batch. */
@@ -176,11 +181,26 @@ const renderedUnread = computed(
 function unreadAbove(index: number): number {
   return props.entries.slice(0, index).filter((e) => !e.is_read).length;
 }
+
+/** `1 entry` / `2 entries`: these labels are read out by screen readers and
+ *  shown as tooltips, so "Mark 1 entries" is a visible mistake. */
+function plural(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
 </script>
 
 <template>
   <section class="entry-list">
-    <header class="list-header">
+    <header class="list-header" :class="{ 'narrow-header': narrow }">
+      <button
+        v-if="narrow"
+        type="button"
+        class="nav-toggle touch-target"
+        aria-label="Open folders and feeds"
+        @click="emit('openNav')"
+      >
+        <span aria-hidden="true">&#9776;</span>
+      </button>
       <div class="view-tabs">
         <button
           :class="{ active: view === 'all' }"
@@ -201,6 +221,7 @@ function unreadAbove(index: number): number {
           class="refresh-all"
           :disabled="busy"
           title="Refresh all feeds"
+          aria-label="Refresh all feeds"
           @click="emit('refreshAll')"
         >
           {{ busy ? "Refreshing…" : "Refresh all" }}
@@ -209,7 +230,8 @@ function unreadAbove(index: number): number {
           v-if="batchActionsAvailable"
           class="mark-rendered"
           :disabled="busy || renderedUnread === 0"
-          :title="`Mark the ${renderedUnread} unread entries on this page as read`"
+          :title="`Mark ${plural(renderedUnread, 'unread entry', 'unread entries')} on this page as read`"
+          :aria-label="`Mark ${plural(renderedUnread, 'unread entry', 'unread entries')} on this page as read`"
           @click="emit('markRendered')"
         >
           Mark {{ renderedUnread }} read
@@ -223,7 +245,11 @@ function unreadAbove(index: number): number {
         :key="entry.id"
         :data-entry-id="entry.id"
         class="entry"
-        :class="{ active: entry.id === selectedEntryId, unread: !entry.is_read }"
+        :class="{
+          active: entry.id === selectedEntryId,
+          unread: !entry.is_read,
+          'narrow-row': narrow,
+        }"
         @click="emit('select', entry)"
       >
         <!-- Decorative: the title carries the meaning. Lazy so covers are only
@@ -246,21 +272,24 @@ function unreadAbove(index: number): number {
         </div>
         <button
           class="star"
-          :class="{ starred: entry.is_starred }"
+          :class="{ starred: entry.is_starred, 'touch-target': narrow }"
           :title="entry.is_starred ? 'Unstar' : 'Star'"
+          :aria-label="entry.is_starred ? 'Unstar entry' : 'Star entry'"
           @click.stop="emit('toggleStar', entry)"
         >
           {{ entry.is_starred ? "\u2605" : "\u2606" }}
         </button>
-        <!-- Floats over the row on hover/focus and reserves no column, so a
-             row without the action keeps its previous layout. The arrow
-             carries the count the action would mark. -->
+        <!-- Floats over the row and reserves no column, so a row without the
+             action keeps its previous layout. The arrow carries the count the
+             action would mark. Revealed on hover where a hover exists, and
+             always present on a touch layout, where there is nothing to hover. -->
         <button
           v-if="batchActionsAvailable && unreadAbove(index) > 0"
           class="mark-above"
+          :class="{ 'touch-target': narrow }"
           :disabled="busy"
-          :title="`Mark the ${unreadAbove(index)} unread entries above this one as read`"
-          :aria-label="`Mark ${unreadAbove(index)} entries above as read`"
+          :title="`Mark the ${plural(unreadAbove(index), 'unread entry', 'unread entries')} above this one as read`"
+          :aria-label="`Mark ${plural(unreadAbove(index), 'entry', 'entries')} above as read`"
           @click.stop="emit('markAbove', index)"
         >
           &#8593;{{ unreadAbove(index) }}
@@ -306,6 +335,21 @@ function unreadAbove(index: number): number {
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid #ddd;
 }
+/* Narrow: the header carries an extra control and has less width, so it wraps
+   instead of clipping the actions out of reach. */
+.narrow-header {
+  flex-wrap: wrap;
+  row-gap: 0.4rem;
+}
+.nav-toggle {
+  border: 1px solid #ccc;
+  background: #f5f5f5;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.45rem 0.6rem;
+}
 .view-tabs {
   display: flex;
   gap: 2px;
@@ -321,6 +365,20 @@ function unreadAbove(index: number): number {
   padding: 0.3rem 0.6rem;
   border-radius: 4px;
   cursor: pointer;
+}
+/* A touch layout has no pointer to hover with, and a tap leaves the
+   last-touched row stuck in its hover state on Android. Every hover rule in
+   this component is therefore gated, and :active carries the feedback. */
+@media (hover: hover) and (pointer: fine) {
+  .view-tabs button:hover {
+    background: #eef2f7;
+  }
+  .refresh-all:hover:not(:disabled) {
+    background: #eaeaea;
+  }
+  .mark-rendered:hover:not(:disabled) {
+    background: #e2edff;
+  }
 }
 .view-tabs button.active {
   background: #2d7ff9;
@@ -382,8 +440,18 @@ function unreadAbove(index: number): number {
   border-bottom: 1px solid #eee;
   cursor: pointer;
 }
-.entry:hover {
-  background: #f5f7fa;
+@media (hover: hover) and (pointer: fine) {
+  .entry:hover {
+    background: #f5f7fa;
+  }
+}
+.entry:active {
+  background: #eef2f7;
+}
+.entry.narrow-row {
+  /* The row is a tap target, so it must be at least as tall as one even when
+     its content is short; the existing fixed height already exceeds 44px. */
+  min-height: 44px;
 }
 .entry.active {
   background: #e3efff;
@@ -469,9 +537,27 @@ function unreadAbove(index: number): number {
   color: #999;
   flex-shrink: 0;
 }
-.star:hover {
-  background: #eee;
-  color: #d4a017;
+@media (hover: hover) and (pointer: fine) {
+  .star:hover {
+    background: #eee;
+    color: #d4a017;
+  }
+}
+/* Enlarged to a touch target only where there is no mouse to aim with; the
+   wide layout keeps its compact control so the row does not change. The
+   minimum hit area itself comes from the global `.touch-target` rule. */
+.narrow-row .mark-above {
+  /* `right` clears the star's widened box. */
+  right: 2.9rem;
+  top: 0.1rem;
+  border-radius: 22px;
+  font-size: 0.75rem;
+}
+/* The chip is always on screen here, so the text has to stop before it instead
+   of running underneath: on desktop the chip only exists while the pointer is
+   on the row, which is why the wide layout needs no such gap. */
+.narrow-row .entry-body {
+  padding-right: 2.5rem;
 }
 .star.starred {
   color: #d4a017;
@@ -494,13 +580,23 @@ function unreadAbove(index: number): number {
   opacity: 0;
   pointer-events: none;
 }
-.entry:hover .mark-above,
-.mark-above:focus-visible {
+/* Only a device with a real pointer can hover, so only there is the control
+   revealed by pointing at the row. */
+@media (hover: hover) and (pointer: fine) {
+  .entry:hover .mark-above,
+  .mark-above:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .mark-above:hover:not(:disabled) {
+    background: #dbe9ff;
+  }
+}
+/* A touch row has nothing to hover with: the action is always on screen and
+   always tappable. */
+.narrow-row .mark-above {
   opacity: 1;
   pointer-events: auto;
-}
-.mark-above:hover:not(:disabled) {
-  background: #dbe9ff;
 }
 .mark-above:disabled {
   opacity: 0;

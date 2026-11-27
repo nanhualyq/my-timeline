@@ -106,27 +106,26 @@ fn set_starred(app: tauri::AppHandle, entry_id: i64, is_starred: bool) -> Result
     db::set_starred(&guard, entry_id, is_starred)
 }
 
-/// Import an OPML file chosen by the frontend. Merge-only; performs no
-/// fetching — entries only arrive through a later manual refresh.
+/// Import OPML text chosen by the frontend. Content-only: the platform's file
+/// picker hands back a filesystem path on desktop and a document reference on
+/// Android, and only the frontend knows how to turn either into text. Merge-only;
+/// performs no fetching — entries only arrive through a later manual refresh.
 #[tauri::command]
-fn import_opml(app: tauri::AppHandle, path: String) -> Result<opml::ImportOutcome, String> {
-    let xml = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+fn import_opml(app: tauri::AppHandle, xml: String) -> Result<opml::ImportOutcome, String> {
     let conn = shared_conn(&app)?;
     let guard = conn.lock().map_err(|e| e.to_string())?;
     opml::import_opml(&guard, &xml)
 }
 
-/// Export all subscriptions (with folder grouping) as OPML to a path chosen
-/// by the frontend.
+/// Render all subscriptions (with folder grouping) as OPML text. The frontend
+/// writes it wherever the platform's file picker pointed.
 #[tauri::command]
-fn export_opml(app: tauri::AppHandle, path: String) -> Result<opml::ExportOutcome, String> {
+fn export_opml(app: tauri::AppHandle) -> Result<opml::ExportOutcome, String> {
     let conn = shared_conn(&app)?;
-    let exported = {
-        let guard = conn.lock().map_err(|e| e.to_string())?;
-        opml::export_opml(&guard)?
-    };
-    std::fs::write(&path, &exported.xml).map_err(|e| format!("cannot write {path}: {e}"))?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    let exported = opml::export_opml(&guard)?;
     Ok(opml::ExportOutcome {
+        xml: exported.xml,
         feeds_exported: exported.feeds_exported,
     })
 }
@@ -227,6 +226,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -235,7 +235,15 @@ pub fn run() {
             // Debug builds must not share the production database: the data dir
             // is derived from the bundle identifier, which `tauri dev` does not
             // override, so dev and release would otherwise open the same file.
-            let data_dir = if cfg!(debug_assertions) {
+            //
+            // Desktop only. On Android the data dir is the app's own
+            // per-package directory, so a debug and a release install of the
+            // same package can never coexist; asking for a sibling directory
+            // (…-dev) lands outside the app's sandbox, where creating it fails
+            // and the database cannot be opened at all.
+            let desktop_debug =
+                cfg!(debug_assertions) && !cfg!(any(target_os = "android", target_os = "ios"));
+            let data_dir = if desktop_debug {
                 data_dir.with_file_name("com.mytimeline.app-dev")
             } else {
                 data_dir

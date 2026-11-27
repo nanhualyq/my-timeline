@@ -2,7 +2,11 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { addFeed, createFolder, exportOpml, importOpml } from "../api";
 import { blockKeyboard } from "../lib/keyboard-blocks";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import {
+  pickOpmlDestination,
+  pickOpmlText,
+  writeOpmlText,
+} from "../lib/opml-file";
 
 defineProps<{
   /** True while a background refresh runs; disables the actions below. */
@@ -74,12 +78,11 @@ async function doImport() {
   opmlError.value = null;
   notice.value = null;
   try {
-    const path = await open({
-      multiple: false,
-      filters: [{ name: "OPML", extensions: ["opml", "xml"] }],
-    });
-    if (typeof path !== "string") return;
-    const outcome = await importOpml(path);
+    // The picker returns a path on desktop and a document reference on
+    // Android; reading through it is the same call either way.
+    const xml = await pickOpmlText();
+    if (xml === null) return;
+    const outcome = await importOpml(xml);
     notice.value =
       `Import complete: ${outcome.feeds_added} added, ` +
       `${outcome.feeds_skipped} skipped, ` +
@@ -94,12 +97,10 @@ async function doExport() {
   opmlError.value = null;
   notice.value = null;
   try {
-    const path = await save({
-      defaultPath: "subscriptions.opml",
-      filters: [{ name: "OPML", extensions: ["opml"] }],
-    });
-    if (!path) return;
-    const outcome = await exportOpml(path);
+    const destination = await pickOpmlDestination();
+    if (!destination) return;
+    const outcome = await exportOpml();
+    await writeOpmlText(destination, outcome.xml);
     notice.value = `Exported ${outcome.feeds_exported} feeds`;
   } catch (e) {
     opmlError.value = String(e);
@@ -203,6 +204,10 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* Phone-sized: the dialog must never be pushed past the viewport edges by
+     its own height or by a raised on-screen keyboard. */
+  padding: 1rem;
+  box-sizing: border-box;
 }
 .dialog {
   background: #fff;
@@ -213,6 +218,10 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 0.7rem;
+  /* Tall content scrolls inside the dialog instead of clipping its actions. */
+  max-height: 100%;
+  overflow-y: auto;
+  box-sizing: border-box;
 }
 .dialog-title {
   margin: 0;

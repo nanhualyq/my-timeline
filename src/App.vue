@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Sidebar from "./components/Sidebar.vue";
 import EntryList from "./components/EntryList.vue";
 import ReadingPane from "./components/ReadingPane.vue";
@@ -43,6 +43,8 @@ import {
 } from "./api";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { message } from "@tauri-apps/plugin-dialog";
+import { useLayout, useMediaQuery, HOVER_MEDIA_QUERY } from "./lib/viewport";
+import { createBackStack, type BackStack } from "./lib/back-stack";
 
 /** Entries per batch. A constant: the app has no settings persistence, and
  *  batch size is not worth adding one for. */
@@ -86,6 +88,19 @@ const editingFeed = ref<Feed | null>(null);
 const settingsOpen = ref(false);
 const helpOpen = ref(false);
 
+/** The published layout: wide shows three columns, narrow shows one pane. */
+const layout = useLayout();
+const narrow = computed(() => layout.value === "narrow");
+
+/** False on a touch screen: nothing there can be hovered, and a reader holding
+ *  a phone has no keyboard to press a shortcut on. */
+const hoverInput = useMediaQuery(HOVER_MEDIA_QUERY);
+
+/** Narrow-only state. The wide layout ignores both: the third column is
+ *  always on screen there, and the sidebar is never an overlay. */
+const drawerOpen = ref(false);
+const readerOpen = ref(false);
+
 /** The list and the pane lend the container what only they can measure or
  *  scroll; neither decides where the cursor is. */
 const listRef = ref<InstanceType<typeof EntryList> | null>(null);
@@ -112,6 +127,80 @@ function openSettings() {
   editingFeed.value = null;
   settingsOpen.value = true;
 }
+
+/* --- Narrow layout navigation -------------------------------------------- */
+
+function openDrawer() {
+  if (!narrow.value) return;
+  drawerOpen.value = true;
+}
+
+function closeDrawer() {
+  drawerOpen.value = false;
+}
+
+/** Leave the reading screen. The selection is kept, so the row the reader was
+ *  on stays marked and reopening it is one tap away. */
+function closeReader() {
+  readerOpen.value = false;
+}
+
+function openReader() {
+  if (narrow.value) readerOpen.value = true;
+}
+
+/**
+ * Crossing the breakpoint has to reconcile the narrow-only state, in one
+ * place: a drawer has nowhere to overlay in the wide layout, while an open
+ * entry is already what the third column shows, so it stays open.
+ */
+watch(narrow, (isNarrow) => {
+  drawerOpen.value = false;
+  if (isNarrow) {
+    readerOpen.value = selectedEntryId.value !== null;
+  }
+});
+
+/* --- System back --------------------------------------------------------- */
+
+/**
+ * The layers the back action can close, bottom to top: the drawer first (it
+ * sits over the list), the reading screen over that, and any blocking dialog
+ * on top of everything. The last entry is what back closes first.
+ */
+const openLayers = computed<string[]>(() => {
+  const layers: string[] = [];
+  if (narrow.value && drawerOpen.value) layers.push("drawer");
+  if (narrow.value && readerOpen.value) layers.push("reader");
+  if (settingsOpen.value || editingFeed.value !== null || helpOpen.value) {
+    layers.push("dialog");
+  }
+  return layers;
+});
+
+/** Close exactly one layer, topmost first: what the system back action asks. */
+function closeTopLayer() {
+  if (settingsOpen.value || editingFeed.value !== null || helpOpen.value) {
+    settingsOpen.value = false;
+    editingFeed.value = null;
+    helpOpen.value = false;
+    return;
+  }
+  if (narrow.value && readerOpen.value) {
+    readerOpen.value = false;
+    return;
+  }
+  if (narrow.value && drawerOpen.value) drawerOpen.value = false;
+}
+
+/** Created during setup so the first history entry can be pushed as soon as a
+ *  layer opens; there is nothing to unwind before that. */
+let backStack: BackStack | null = null;
+watch(
+  openLayers,
+  (layers) => backStack?.sync(layers.length),
+  { flush: "post" },
+);
 
 function startEdit(feed: Feed) {
   settingsOpen.value = false;
@@ -314,6 +403,10 @@ function select(sel: Selection) {
   selectedEntryId.value = null;
   selectedEntry.value = null;
   lastCursorIndex.value = 0;
+  // On a phone the list is the only thing on screen after a selection; the
+  // drawer that made the selection gets out of the way.
+  closeDrawer();
+  readerOpen.value = false;
   startOver();
 }
 
@@ -332,6 +425,7 @@ async function selectEntry(item: EntryListItem) {
   selectedEntryId.value = item.id;
   // Never leave the previous article on screen under a new title.
   selectedEntry.value = null;
+  openReader();
   try {
     const full = await getEntry(item.id);
     // A newer selection, or a cleared pane, already moved on.
@@ -544,6 +638,9 @@ function openAtCursor(index: number) {
   lastCursorIndex.value = index;
   if (row.id === selectedEntryId.value) return;
   selectedEntryId.value = row.id;
+  // A hardware keyboard on a phone opens the reading screen for the row the
+  // cursor lands on, exactly like tapping it does.
+  openReader();
   // The previous article stays on screen until the new one lands: blanking the
   // pane on every keystroke of a burst would only flicker. The flush keeps the
   // stale-response guard, so a late reply for an abandoned row is dropped.
@@ -726,6 +823,9 @@ function runAction(action: Action, count: number | null) {
       paneRef.value?.scrollByScreens(-steps);
       return;
     case "toggle-help":
+      // The shortcut reference is not offered on a touch-only layout: there
+      // is no keyboard to use it with.
+      if (narrow.value && !hoverInput.value) return;
       helpOpen.value = true;
       return;
     case "toggle-read":
@@ -814,15 +914,69 @@ function flushOnLeave() {
   void flushBurst();
 }
 
+/* --- Returning to the app ------------------------------------------------- */
+
+/** How long the app must have been hidden for a return to count as a resume.
+ *  Opening the app switcher or the notification shade must not fetch. */
+const RESUME_REFRESH_MS = 60_000;
+
+let hiddenAt: number | null = null;
+
+/**
+ * Refresh what the reader is looking at after the app comes back from the
+ * background. Deliberately quieter than the buttons: no summary dialog, so a
+ * resume never puts a modal in front of the list. Failures land on the same
+ * error line as every other failure.
+ */
+async function resumeRefresh() {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    const sel = selection.value;
+    if (sel.kind === "feed") await refreshFeed(sel.id);
+    else if (sel.kind === "folder") await refreshFolder(sel.id);
+    else await refreshAll();
+    await reload();
+  } catch (e) {
+    loadError.value = String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/**
+ * Android reports backgrounding through the document's visibility. Only the
+ * narrow layout refreshes on it: on a desktop window, losing focus means the
+ * reader is looking at something else on the same screen.
+ */
+function onVisibilityChange() {
+  if (document.visibilityState === "hidden") {
+    hiddenAt = Date.now();
+    return;
+  }
+  const hiddenSince = hiddenAt;
+  hiddenAt = null;
+  if (!narrow.value) return;
+  if (hiddenSince === null) return;
+  if (Date.now() - hiddenSince < RESUME_REFRESH_MS) return;
+  void resumeRefresh();
+}
+
 onMounted(() => {
+  backStack = createBackStack({ onBack: closeTopLayer });
+  backStack.sync(openLayers.value.length);
   void reload();
   document.addEventListener("keydown", onKeydown);
+  document.addEventListener("visibilitychange", onVisibilityChange);
   window.addEventListener("blur", flushOnLeave);
   window.addEventListener("beforeunload", flushOnLeave);
 });
 
 onBeforeUnmount(() => {
+  backStack?.dispose();
+  backStack = null;
   document.removeEventListener("keydown", onKeydown);
+  document.removeEventListener("visibilitychange", onVisibilityChange);
   window.removeEventListener("blur", flushOnLeave);
   window.removeEventListener("beforeunload", flushOnLeave);
   clearPrefixTimer();
@@ -834,7 +988,17 @@ onBeforeUnmount(() => {
 <template>
   <main class="layout">
     <p v-if="loadError" class="global-error">{{ loadError }}</p>
+    <!-- Narrow only: the drawer is an overlay, so the list behind it keeps its
+         scroll position and stays inert to taps through the backdrop. -->
+    <div
+      v-if="narrow && drawerOpen"
+      class="drawer-backdrop"
+      @click="closeDrawer"
+    ></div>
     <Sidebar
+      v-show="!narrow || drawerOpen"
+      class="sidebar-pane"
+      :class="{ drawer: narrow }"
       :feeds="feeds"
       :folders="folders"
       :selection="selection"
@@ -842,6 +1006,7 @@ onBeforeUnmount(() => {
       :all-count="counts.all_entries"
       :starred-count="counts.starred_entries"
       :unread-count="counts.unread_entries"
+      :narrow="narrow"
       @select="select"
       @changed="reload"
       @remove="doRemove"
@@ -851,6 +1016,7 @@ onBeforeUnmount(() => {
       @open-settings="openSettings"
     />
     <EntryList
+      v-show="!narrow || !readerOpen"
       ref="listRef"
       :entries="entries"
       :selected-entry-id="selectedEntryId"
@@ -864,6 +1030,7 @@ onBeforeUnmount(() => {
       :feed-titles="feedTitles"
       :show-feed-label="showEntryFeedLabel"
       :batch-actions-available="batchActionsAvailable"
+      :narrow="narrow"
       @select="selectEntry"
       @toggle-star="toggleStar"
       @refresh-all="doRefreshAll"
@@ -871,13 +1038,17 @@ onBeforeUnmount(() => {
       @load-more="loadMore"
       @mark-rendered="markRenderedRead"
       @mark-above="markAboveRead"
+      @open-nav="openDrawer"
     />
     <ReadingPane
+      v-show="!narrow || readerOpen"
       ref="paneRef"
       :entry="selectedEntry"
       :feed="selectedFeed"
+      :narrow="narrow"
       @toggle-read="toggleRead"
       @open-link="openLink"
+      @close="closeReader"
     />
     <FeedEditDialog
       v-if="editingFeed"
@@ -908,6 +1079,34 @@ body {
 #app {
   height: 100%;
 }
+
+/* The minimum hit area for a fingertip. Applied only on the narrow layout, so
+   a wide layout keeps its compact controls; one definition keeps every touch
+   target the same size. */
+.touch-target {
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* The same minimum, for the controls whose sizing belongs to their component
+   rather than to a `touch-target` class. Written once here so a control added
+   to a header, a pane, or a dialog cannot quietly end up too small to tap —
+   measured on the emulator, the header buttons were 28 CSS px tall. */
+:root[data-layout="narrow"] .list-header button,
+:root[data-layout="narrow"] .pane-header button,
+:root[data-layout="narrow"] .pane-actions .btn,
+:root[data-layout="narrow"] .dialog button,
+:root[data-layout="narrow"] .settings-btn,
+:root[data-layout="narrow"] .row-menu-item {
+  min-width: 44px;
+  min-height: 44px;
+}
+:root[data-layout="narrow"] .feed-item {
+  min-height: 44px;
+}
 </style>
 
 <style scoped>
@@ -920,6 +1119,51 @@ body {
   height: 100vh;
   overflow: hidden;
   position: relative;
+  /* Safe areas: on Android the activity runs edge-to-edge, so the status bar
+     and the gesture strip are painted over the webview. The insets are 0 on
+     desktop and on devices without cutouts, which is why this applies to every
+     layout rather than only the narrow one — a landscape window is wide and
+     still has a status bar over its first column. */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  box-sizing: border-box;
+}
+
+/* Narrow layout. The layout comes from `useLayout()` so the breakpoint is
+   written down once (src/lib/viewport.ts); the CSS only selects on it. */
+:root[data-layout="narrow"] .layout {
+  grid-template-columns: minmax(0, 1fr);
+  /* dvh: the on-screen keyboard and the URL bar shrink the visual viewport on
+     Android, and the columns must not extend under them. */
+  height: 100dvh;
+}
+
+.drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 19;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+/* The sidebar becomes an overlay: out of the grid flow, over the list, with a
+   scrim behind it. `v-show` keeps it mounted so its scroll position survives
+   opening and closing the drawer.
+
+   The insets are repeated here on purpose: an absolutely positioned box is
+   laid out against the ancestor's padding box, so the padding on `.layout`
+   does not move it, and without `top` the drawer's first row lands under the
+   status bar. */
+:root[data-layout="narrow"] .sidebar-pane {
+  position: absolute;
+  top: env(safe-area-inset-top, 0px);
+  bottom: env(safe-area-inset-bottom, 0px);
+  left: env(safe-area-inset-left, 0px);
+  width: min(20rem, 85vw);
+  z-index: 20;
+  box-shadow: 0 0 1.5rem rgba(0, 0, 0, 0.25);
+  background: #fafafa;
 }
 .global-error {
   position: absolute;

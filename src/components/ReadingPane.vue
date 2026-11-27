@@ -5,11 +5,16 @@ import type { Entry, Feed } from "../api";
 const props = defineProps<{
   entry: Entry | null;
   feed: Feed | null;
+  /** True on the one-pane layout, where this component is a whole screen and
+   *  therefore needs its own way back to the list. */
+  narrow?: boolean;
 }>();
 
 const emit = defineEmits<{
   toggleRead: [];
   openLink: [url: string];
+  /** Narrow layout only: return to the entry list. */
+  close: [];
 }>();
 
 const contentEl = ref<HTMLElement | null>(null);
@@ -38,7 +43,16 @@ defineExpose({ scrollByScreens });
 <template>
   <section class="reading-pane">
     <template v-if="entry">
-      <header class="pane-header">
+      <header class="pane-header" :class="{ 'narrow-header': props.narrow }">
+        <button
+          v-if="props.narrow"
+          type="button"
+          class="btn back touch-target"
+          aria-label="Back to entry list"
+          @click="emit('close')"
+        >
+          <span aria-hidden="true">&#8592;</span>
+        </button>
         <div class="pane-meta">
           <h2 class="pane-title">{{ entry.title }}</h2>
           <p class="pane-sub">
@@ -59,7 +73,11 @@ defineExpose({ scrollByScreens });
           >
             Open original
           </a>
-          <button class="btn" @click="emit('toggleRead')">
+          <button
+            class="btn"
+            :aria-label="entry.is_read ? 'Mark entry unread' : 'Mark entry read'"
+            @click="emit('toggleRead')"
+          >
             Mark {{ entry.is_read ? "unread" : "read" }}
           </button>
         </div>
@@ -88,6 +106,19 @@ defineExpose({ scrollByScreens });
   border-bottom: 1px solid #ddd;
   flex-shrink: 0;
 }
+/* Narrow: the header is a screen header, so it wraps instead of squeezing the
+   title to nothing beside the actions. */
+.narrow-header {
+  flex-wrap: wrap;
+  row-gap: 0.4rem;
+}
+.narrow-header .pane-meta {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+.narrow-header .pane-actions {
+  flex-wrap: wrap;
+}
 .pane-title {
   margin: 0 0 0.25rem;
   font-size: 1.1rem;
@@ -112,8 +143,15 @@ defineExpose({ scrollByScreens });
   color: inherit;
   text-decoration: none;
 }
-.btn:hover {
-  background: #eaeaea;
+.back {
+  /* A screen-level control on the narrow layout: it has to be tappable. */
+  font-size: 1rem;
+  line-height: 1;
+}
+@media (hover: hover) and (pointer: fine) {
+  .btn:hover {
+    background: #eaeaea;
+  }
 }
 .content {
   padding: 1rem 1.25rem;

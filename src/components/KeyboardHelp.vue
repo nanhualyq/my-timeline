@@ -56,10 +56,15 @@ onBeforeUnmount(() => releaseKeyboard());
   align-items: center;
   justify-content: center;
   background: rgba(0, 0, 0, 0.35);
+  padding: 1rem;
+  box-sizing: border-box;
 }
 .help {
   width: min(46rem, 92vw);
   max-height: 86vh;
+  /* dvh where supported: the visual viewport is what is actually on screen
+     when a URL bar or the on-screen keyboard is showing. */
+  max-height: 86dvh;
   display: flex;
   flex-direction: column;
   background: #fff;
@@ -86,12 +91,14 @@ onBeforeUnmount(() => releaseKeyboard());
   color: #666;
   padding: 0.2rem 0.4rem;
   border-radius: 4px;
+  /* A dialog close control is a tap target wherever it appears. */
+  min-width: 44px;
+  min-height: 44px;
 }
 .help-close:hover {
   background: #eee;
   color: #000;
-}
-.help-sections {
+}.help-sections {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
   gap: 0.5rem 1.5rem;

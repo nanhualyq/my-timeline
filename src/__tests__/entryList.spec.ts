@@ -39,6 +39,7 @@ function render(overrides: Partial<Record<string, unknown>> = {}): VueWrapper {
       feedTitles: { 1: "Feed One" },
       showFeedLabel: true,
       batchActionsAvailable: true,
+      narrow: false,
       ...overrides,
     },
   });
