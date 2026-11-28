@@ -5,6 +5,7 @@ import App from "../App.vue";
 import EntryList from "../components/EntryList.vue";
 import ReadingPane from "../components/ReadingPane.vue";
 import TouchMenu from "../components/TouchMenu.vue";
+import Sidebar from "../components/Sidebar.vue";
 import UndoBar from "../components/UndoBar.vue";
 import {
   FakeBackend,
@@ -539,5 +540,104 @@ describe("returning from the reader", () => {
     } finally {
       Element.prototype.scrollIntoView = original;
     }
+  });
+});
+
+/** The arguments of the most recent per-feed refresh. */
+function lastRefreshArgs(): Record<string, unknown> | undefined {
+  const calls = backend.calls.filter((c) => c.cmd === "refresh_feed");
+  return calls[calls.length - 1]?.args;
+}
+
+/**
+ * A downward drag on the list itself, as touch events.
+ *
+ * The pull listens to touch rather than pointer events on purpose: inside a
+ * scroll port the browser claims the vertical pan and cancels the pointer
+ * stream, so a pointer-driven pull can never commit on a device.
+ */
+function touch(target: EventTarget, type: string, x: number, y: number) {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  const point = { clientX: x, clientY: y };
+  Object.assign(event, {
+    touches: type === "touchend" ? [] : [point],
+    changedTouches: [point],
+  });
+  target.dispatchEvent(event);
+  return event;
+}
+
+async function pullList(wrapper: VueWrapper, dy: number) {
+  const listEl = wrapper.get(".entries").element;
+  touch(listEl, "touchstart", 180, 120);
+  touch(listEl, "touchmove", 180, 120 + dy / 2);
+  touch(listEl, "touchmove", 180, 120 + dy);
+  touch(listEl, "touchend", 180, 120 + dy);
+  await flush();
+}
+
+describe("pulling the list to refresh", () => {
+  it("refreshes the feed the list is showing", async () => {
+    const wrapper = await mountApp();
+    wrapper.findComponent(Sidebar).vm.$emit("select", { kind: "feed", id: 1 });
+    await flush();
+    const before = backend.countCalls("refresh_feed");
+
+    await pullList(wrapper, 200);
+
+    expect(backend.countCalls("refresh_feed")).toBe(before + 1);
+    expect(lastRefreshArgs()).toEqual({ feedId: 1 });
+  });
+
+  it("refreshes every feed when the list shows all entries", async () => {
+    const wrapper = await mountApp();
+    const before = backend.countCalls("refresh_feed");
+
+    await pullList(wrapper, 200);
+
+    expect(backend.countCalls("refresh_feed")).toBe(before + 1);
+    expect(lastRefreshArgs()).toEqual({ feedId: 1 });
+  });
+
+  it("refreshes nothing when the pull is too short", async () => {
+    const wrapper = await mountApp();
+    const before = backend.countCalls("refresh_feed");
+
+    await pullList(wrapper, 40);
+
+    expect(backend.countCalls("refresh_feed")).toBe(before);
+  });
+
+  it("scrolls instead of refreshing when the list is not at its top", async () => {
+    const wrapper = await mountApp();
+    const listEl = wrapper.get(".entries").element;
+    Object.defineProperty(listEl, "scrollTop", { value: 400, configurable: true });
+    const before = backend.countCalls("refresh_feed");
+
+    await pullList(wrapper, 200);
+
+    expect(backend.countCalls("refresh_feed")).toBe(before);
+  });
+
+  it("reports the pull in the panel rather than refreshing silently", async () => {
+    const wrapper = await mountApp();
+    backend.defaultRefresh = { new_entries: 2 };
+
+    await pullList(wrapper, 200);
+
+    expect(wrapper.find(".refresh-panel").exists()).toBe(true);
+  });
+
+  it("does not start a second run while one is in flight", async () => {
+    const wrapper = await mountApp();
+    const gate = backend.holdNext("refresh_feed");
+
+    await pullList(wrapper, 200);
+    const inFlight = backend.countCalls("refresh_feed");
+    await pullList(wrapper, 200);
+
+    expect(backend.countCalls("refresh_feed")).toBe(inFlight);
+    gate.release();
+    await flush();
   });
 });

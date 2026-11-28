@@ -135,9 +135,9 @@ describe("touch layout controls", () => {
     expect(wrapper.get(".nav-toggle").attributes("aria-label")).toBe(
       "Open folders and feeds",
     );
-    expect(wrapper.get(".refresh-all").attributes("aria-label")).toBe(
-      "Refresh all feeds",
-    );
+    // Refreshing on a phone is the pull gesture, so the header keeps only the
+    // drawer control — named, like every other control.
+    expect(wrapper.find(".refresh-all").exists()).toBe(false);
   });
 
   it("sizes the drawer's controls for a fingertip", async () => {

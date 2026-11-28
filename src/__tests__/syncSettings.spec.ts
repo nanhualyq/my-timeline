@@ -52,7 +52,7 @@ function backendWith(handlers: Handlers) {
 
 function mountDialog() {
   return mount(SettingsDialog, {
-    props: { busy: false },
+    props: { busy: false, lastScheduled: null },
     global: { stubs: { teleport: true } },
   });
 }
@@ -251,5 +251,71 @@ describe("WebDAV section", () => {
       expect(button.attributes("disabled")).toBeDefined();
     }
     expect(harness.invoke).not.toHaveBeenCalledWith("sync_now", expect.anything());
+  });
+});
+
+describe("the refresh schedule", () => {
+  it("shows the saved schedule and persists a change", async () => {
+    const saved: { enabled: boolean; interval_minutes: number }[] = [];
+    backendWith({
+      load_refresh_settings: () => ({ enabled: true, interval_minutes: 60 }),
+      save_refresh_settings: () => null,
+    });
+    const wrapper = mountDialog();
+    await flush();
+
+    const checkbox = wrapper.get(".schedule-switch input");
+    expect((checkbox.element as HTMLInputElement).checked).toBe(true);
+    expect((wrapper.get(".schedule-interval").element as HTMLSelectElement).value).toBe("60");
+
+    await wrapper.get(".schedule-interval").setValue("15");
+    await flush();
+
+    const calls = harness.invoke.mock.calls.filter((c) => c[0] === "save_refresh_settings");
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toEqual({ settings: { enabled: true, interval_minutes: 15 } });
+    saved.push(calls[0][1].settings);
+    expect(wrapper.text()).toContain("Refreshing every 15 minutes");
+  });
+
+  it("turns the schedule off and says so", async () => {
+    backendWith({
+      load_refresh_settings: () => ({ enabled: true, interval_minutes: 30 }),
+      save_refresh_settings: () => null,
+    });
+    const wrapper = mountDialog();
+    await flush();
+
+    await wrapper.get(".schedule-switch input").setValue(false);
+    await flush();
+
+    const calls = harness.invoke.mock.calls.filter((c) => c[0] === "save_refresh_settings");
+    expect(calls[0][1]).toEqual({ settings: { enabled: false, interval_minutes: 30 } });
+    expect(wrapper.text()).toContain("Scheduled refresh is off");
+  });
+
+  it("reports when the last scheduled refresh ran and when the next is due", async () => {
+    backendWith({
+      load_refresh_settings: () => ({ enabled: true, interval_minutes: 30 }),
+    });
+    const wrapper = mount(SettingsDialog, {
+      props: { busy: false, lastScheduled: "2026-11-28T10:00:00+00:00" },
+      global: { stubs: { teleport: true } },
+    });
+    await flush();
+
+    const text = wrapper.text();
+    expect(text).toContain("Last scheduled refresh");
+    expect(text).toContain("Next check");
+  });
+
+  it("offers a fixed set of intervals rather than a free number", async () => {
+    backendWith({ load_refresh_settings: () => ({ enabled: false, interval_minutes: 30 }) });
+    const wrapper = mountDialog();
+    await flush();
+
+    const options = wrapper.findAll(".schedule-interval option");
+    expect(options.map((o) => o.attributes("value"))).toEqual(["15", "30", "60", "180"]);
+    expect((wrapper.get(".schedule-interval").element as HTMLSelectElement).disabled).toBe(true);
   });
 });

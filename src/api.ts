@@ -62,9 +62,24 @@ export interface Cursor {
   id: number;
 }
 
-export interface RefreshOutcome {
+/**
+ * What one feed's refresh produced. A failed fetch is a normal outcome: the
+ * reason travels here, the feed row records it, and the run carries on.
+ */
+export interface FeedRefresh {
   feed_id: number;
   error: string | null;
+  /** Entries this refresh added that the library did not hold before. */
+  new_entries: number;
+  /** The response status when the server answered, so a refusal (429, 503) is
+   *  distinguishable from a broken feed. */
+  http_status: number | null;
+}
+
+/** The refresh schedule. Device-local: it never enters the sync document. */
+export interface RefreshSettings {
+  enabled: boolean;
+  interval_minutes: number;
 }
 
 export type EntryView = "all" | "unread";
@@ -156,17 +171,21 @@ export function addFeed(url: string): Promise<Feed> {
   return invoke<Feed>("add_feed", { url });
 }
 
-export function refreshFeed(feedId: number): Promise<void> {
-  return invoke("refresh_feed", { feedId });
+export function refreshFeed(feedId: number): Promise<FeedRefresh> {
+  return invoke<FeedRefresh>("refresh_feed", { feedId });
 }
 
-export function refreshAll(): Promise<RefreshOutcome[]> {
-  return invoke<RefreshOutcome[]>("refresh_all");
+/** Every feed holding a starred entry: the Starred view's refresh scope. */
+export function starredFeedIds(): Promise<number[]> {
+  return invoke<number[]>("starred_feed_ids");
 }
 
-/** Refresh every feed under a folder; resolves with per-feed outcomes. */
-export function refreshFolder(folderId: number): Promise<RefreshOutcome[]> {
-  return invoke<RefreshOutcome[]>("refresh_folder", { folderId });
+export function loadRefreshSettings(): Promise<RefreshSettings> {
+  return invoke<RefreshSettings>("load_refresh_settings");
+}
+
+export function saveRefreshSettings(settings: RefreshSettings): Promise<void> {
+  return invoke("save_refresh_settings", { settings });
 }
 
 export interface ImportOutcome {

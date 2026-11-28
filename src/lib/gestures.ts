@@ -43,6 +43,13 @@ export const EDGE_GUTTER = 32;
 /** How long a motionless press must last to count as a long press. */
 export const LONG_PRESS_MS = 500;
 
+/** The pull's own numbers. The commit distance is measured on the resisted
+ *  offset, so the list has to travel twice as far under the finger. */
+export const PULL_SLOP = 8;
+export const PULL_COMMIT = 64;
+export const PULL_MAX_OFFSET = 96;
+export const PULL_RESISTANCE = 0.5;
+
 export type DragPhase = "pending" | "ignored" | "dragging";
 
 export type DragDirection = "left" | "right";
@@ -130,6 +137,165 @@ export function releaseDrag(state: DragState): DragDirection | null {
   const intent = dragIntent(state);
   if (intent === null) return null;
   return Math.abs(state.dx) >= state.commitAt ? intent : null;
+}
+
+/* --- The pull at the top of a list --------------------------------------- */
+
+export type PullPhase = "pending" | "ignored" | "pulling";
+
+export interface PullState {
+  readonly phase: PullPhase;
+  /** Downward travel since the press began, unsigned. */
+  readonly dy: number;
+}
+
+/**
+ * A press on a list that is already at its top may become a pull. Anywhere else
+ * the press belongs to scrolling, which is why this is decided at touch-down
+ * rather than later: once the browser has started scrolling, no amount of
+ * pointer samples can take the gesture back.
+ */
+export function beginPull(start: { atTop: boolean }): PullState {
+  return { phase: start.atTop ? "pending" : "ignored", dy: 0 };
+}
+
+/**
+ * Decide what a movement means. Downward travel is the pull; sideways travel is
+ * the row's drag; upward travel is scrolling, which the list keeps.
+ */
+export function resolvePull(
+  state: PullState,
+  sample: { dx: number; dy: number },
+): PullState {
+  if (state.phase === "ignored") return state;
+  const { dx, dy } = sample;
+  if (dy < 0) return { phase: "ignored", dy: 0 };
+  if (Math.abs(dy) < PULL_SLOP) return { phase: state.phase, dy: Math.max(dy, 0) };
+  if (Math.abs(dx) >= Math.abs(dy) * DIRECTION_RATIO && Math.abs(dx) > DIRECTION_LOCK) {
+    // Clearly sideways: this is a row action, not a pull.
+    return { phase: "ignored", dy: 0 };
+  }
+  return { phase: "pulling", dy };
+}
+
+/** How far the list follows the finger: resisted, and never past the cap. */
+export function pullOffset(state: PullState): number {
+  if (state.phase !== "pulling") return 0;
+  return Math.min(state.dy * PULL_RESISTANCE, PULL_MAX_OFFSET);
+}
+
+/** Whether releasing now refreshes. */
+export function releasePull(state: PullState): boolean {
+  return pullOffset(state) >= PULL_COMMIT;
+}
+
+export interface PullOptions {
+  /** False where no pull should exist: a pointer layout, or the reading pane. */
+  enabled: () => boolean;
+  /** The scroll port whose top is the only place a pull can begin. */
+  port: () => HTMLElement | null;
+  /** Released past the threshold. */
+  onRefresh: () => void;
+}
+
+export interface PullToRefresh {
+  /** Travel of the list while the finger is pulling, in pixels. */
+  offset: Ref<number>;
+  /** True once the movement has been claimed. */
+  pulling: Ref<boolean>;
+  /** Bind to the scroll port. All four, because the pull owns the whole move. */
+  onTouchStart: (event: TouchEvent) => void;
+  onTouchMove: (event: TouchEvent) => void;
+  onTouchEnd: (event: TouchEvent) => void;
+  onTouchCancel: (event: TouchEvent) => void;
+}
+
+/** The first touch of an event, whichever list the browser put it in. */
+function firstTouch(event: TouchEvent): Touch | null {
+  return event.touches[0] ?? event.changedTouches[0] ?? null;
+}
+
+/**
+ * The pull, driven by touch events rather than pointer events.
+ *
+ * Deliberately: inside a scroll port the browser claims a vertical pan and
+ * sends `pointercancel` to whatever was following it, so a pointer-based pull
+ * never sees enough travel to commit — the list rubber-bands instead. Claiming
+ * the gesture back takes a non-passive `touchmove` that calls
+ * `preventDefault`, which is also why this machine is separate from the row
+ * drags (they only ever want the horizontal axis, which `touch-action: pan-y`
+ * already leaves to them).
+ *
+ * Nothing is prevented until the pull is actually claimed: a sideways drag, an
+ * upward drag, or a press on a scrolled list leaves the browser's own handling
+ * completely alone.
+ */
+export function usePullToRefresh(options: PullOptions): PullToRefresh {
+  const offset = ref(0);
+  const pulling = ref(false);
+
+  let state: PullState | null = null;
+  let origin = { x: 0, y: 0 };
+
+  function reset() {
+    state = null;
+    offset.value = 0;
+    pulling.value = false;
+  }
+
+  function onTouchStart(event: TouchEvent) {
+    if (!options.enabled()) return;
+    // A second finger is a pinch or a two-finger scroll, not a pull.
+    if (event.touches.length !== 1) {
+      reset();
+      return;
+    }
+    const port = options.port();
+    const touch = firstTouch(event);
+    if (!port || !touch) return;
+    origin = { x: touch.clientX, y: touch.clientY };
+    state = beginPull({ atTop: port.scrollTop <= 0 });
+  }
+
+  function onTouchMove(event: TouchEvent) {
+    if (state === null) return;
+    const touch = firstTouch(event);
+    if (!touch) return;
+    const resolved = resolvePull(state, {
+      dx: touch.clientX - origin.x,
+      dy: touch.clientY - origin.y,
+    });
+    if (resolved.phase === "ignored") {
+      if (resolved !== state) reset();
+      state = null;
+      return;
+    }
+    state = resolved;
+    if (resolved.phase !== "pulling") return;
+    // Claim the gesture from the browser's scrolling, and only now.
+    if (event.cancelable) event.preventDefault();
+    offset.value = pullOffset(resolved);
+    pulling.value = true;
+  }
+
+  function finish(commit: boolean) {
+    if (state === null) return;
+    const released = commit && releasePull(state);
+    reset();
+    if (released) options.onRefresh();
+  }
+
+  function onTouchEnd() {
+    finish(true);
+  }
+
+  function onTouchCancel() {
+    finish(false);
+  }
+
+  onBeforeUnmount(reset);
+
+  return { offset, pulling, onTouchStart, onTouchMove, onTouchEnd, onTouchCancel };
 }
 
 /** What the finger is dragging. The composable never interprets it. */

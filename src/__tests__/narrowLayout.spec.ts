@@ -199,8 +199,9 @@ describe("narrow layout", () => {
     expect(list(wrapper).props("narrow")).toBe(true);
     expect(wrapper.get(".list-header").classes()).toContain("narrow-header");
     expect(wrapper.get(".entry").classes()).toContain("narrow-row");
-    // The list header keeps both actions reachable at phone width.
-    expect(wrapper.find(".refresh-all").exists()).toBe(true);
+    // The one-pane layout refreshes by pulling the list, so the text button is
+    // not offered there.
+    expect(wrapper.find(".refresh-all").exists()).toBe(false);
   });
 
   it("keeps an open entry when the viewport becomes wide again", async () => {

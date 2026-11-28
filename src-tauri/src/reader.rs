@@ -1,78 +1,48 @@
 use crate::db::{self, FeedDto};
 use crate::fetch::{self, fetch_and_store};
-use futures::stream::{FuturesUnordered, StreamExt};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
 pub type SharedConn = Arc<Mutex<Connection>>;
 
-/// Bounded concurrency for full refreshes.
-pub const MAX_CONCURRENT_FETCHES: usize = 5;
+/// What one feed's refresh produced.
+///
+/// A failed fetch is a normal outcome, not a command error: the run reports it,
+/// the feed row records it, and the other feeds carry on. The status is carried
+/// separately from the message so the run can recognize a rate-limit refusal.
+#[derive(serde::Serialize)]
+pub struct FeedRefresh {
+    pub feed_id: i64,
+    pub error: Option<String>,
+    /// Entries this refresh added that the library did not hold before.
+    pub new_entries: u32,
+    pub http_status: Option<u16>,
+}
 
-/// Refresh a single feed. Returns Ok(()) when the fetch succeeded, Err(reason)
-/// when it failed (the failure is already recorded on the feed row).
-pub async fn refresh_feed(conn: SharedConn, feed_id: i64) -> Result<(), String> {
+/// Refresh a single feed. Errors only when the feed is unknown; a fetch or
+/// parse failure comes back as `error` with the reason already recorded on the
+/// feed row.
+pub async fn refresh_feed(conn: SharedConn, feed_id: i64) -> Result<FeedRefresh, String> {
     let url = {
         let guard = conn.lock().map_err(|e| e.to_string())?;
         db::feed_url_by_id(&guard, feed_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("feed {feed_id} not found"))?
     };
-    fetch_and_store(&conn, feed_id, &url).await
-}
-
-/// Refresh every feed concurrently with a bounded worker set.
-/// Each feed's outcome is recorded independently; this never fails as a whole.
-/// Returns (feed_id, result) for every feed.
-pub async fn refresh_all(conn: SharedConn) -> Vec<(i64, Result<(), String>)> {
-    let targets = {
-        match conn.lock() {
-            Ok(guard) => db::all_feed_ids_and_urls(&guard).unwrap_or_default(),
-            Err(_) => return vec![],
-        }
-    };
-    refresh_targets(conn, targets).await
-}
-
-/// Refresh every feed assigned to a folder with the same bounded concurrency
-/// and per-feed failure isolation as a full refresh. Returns (feed_id, result)
-/// for each of the folder's feeds. Errors when the folder is unknown.
-pub async fn refresh_folder(
-    conn: SharedConn,
-    folder_id: i64,
-) -> Result<Vec<(i64, Result<(), String>)>, String> {
-    let targets = {
-        let guard = conn.lock().map_err(|e| e.to_string())?;
-        db::feed_ids_and_urls_in_folder(&guard, folder_id)?
-    };
-    Ok(refresh_targets(conn, targets).await)
-}
-
-/// Refresh a target list concurrently with a bounded worker set.
-/// Each feed's outcome is recorded independently; never fails as a whole.
-async fn refresh_targets(
-    conn: SharedConn,
-    targets: Vec<(i64, String)>,
-) -> Vec<(i64, Result<(), String>)> {
-    let mut results = Vec::with_capacity(targets.len());
-    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-    let mut pending = targets.into_iter();
-
-    loop {
-        while in_flight.len() < MAX_CONCURRENT_FETCHES {
-            let Some((feed_id, url)) = pending.next() else { break };
-            let conn = conn.clone();
-            in_flight.push(async move {
-                let result = fetch_and_store(&conn, feed_id, &url).await;
-                (feed_id, result)
-            });
-        }
-        match in_flight.next().await {
-            Some(item) => results.push(item),
-            None => break,
-        }
-    }
-    results
+    Ok(match fetch_and_store(&conn, feed_id, &url).await {
+        Ok(new_entries) => FeedRefresh {
+            feed_id,
+            error: None,
+            new_entries,
+            http_status: None,
+        },
+        Err(e) => FeedRefresh {
+            feed_id,
+            error: Some(e.message),
+            new_entries: 0,
+            http_status: e.status,
+        },
+    })
 }
 
 /// The outcome of an add-feed attempt.
@@ -81,13 +51,6 @@ pub enum AddFeedResult {
     Existing(FeedDto),
     /// A new subscription.
     Added(FeedDto),
-}
-
-/// Serializable per-feed outcome of a full refresh.
-#[derive(serde::Serialize)]
-pub struct RefreshOutcome {
-    pub feed_id: i64,
-    pub error: Option<String>,
 }
 
 /// Add a subscription from a user-supplied URL.
@@ -139,8 +102,8 @@ async fn finish_add(
 ) -> Result<AddFeedResult, String> {
     let dto = {
         let guard = conn.lock().map_err(|e| e.to_string())?;
-        let id = fetch::store_feed(&guard, url, &parsed)?;
-        db::get_feed(&guard, id)
+        let stored = fetch::store_feed(&guard, url, &parsed)?;
+        db::get_feed(&guard, stored.feed_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "feed vanished after insert".to_string())?
     };
@@ -194,6 +157,16 @@ mod tests {
 
     /// Minimal local HTTP server serving fixed responses by path.
     fn serve(routes: Vec<(&'static str, String)>) -> String {
+        let with_ok: Vec<(&'static str, &'static str, String)> = routes
+            .into_iter()
+            .map(|(path, body)| (path, "200 OK", body))
+            .collect();
+        serve_with_status(with_ok)
+    }
+
+    /// Like `serve`, but each route answers with the status it names — for the
+    /// refusals a feed run has to recognize.
+    fn serve_with_status(routes: Vec<(&'static str, &'static str, String)>) -> String {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -213,8 +186,8 @@ mod tests {
                     .to_string();
                 let (status, body) = routes
                     .iter()
-                    .find(|(p, _)| *p == path)
-                    .map(|(_, b)| ("200 OK", b.clone()))
+                    .find(|(p, _, _)| *p == path)
+                    .map(|(_, status, b)| (*status, b.clone()))
                     .unwrap_or(("404 Not Found", "not found".to_string()));
                 let resp = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -298,38 +271,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_all_isolates_failures() {
+    async fn refresh_reports_what_a_successful_feed_added() {
         let base = serve(vec![("/good.xml", FEED_A.to_string())]);
         let conn = shared();
-        // Feed A: local server (works). Feed B: unroutable port (fails fast).
         let good_id = {
             let guard = conn.lock().unwrap();
             db::insert_or_update_feed(&guard, &format!("{base}/good.xml"), "Good", None).unwrap()
         };
-        let bad_id = {
-            let guard = conn.lock().unwrap();
-            db::insert_or_update_feed(
-                &guard,
-                "http://127.0.0.1:9/bad.xml",
-                "Bad",
-                None,
-            )
-            .unwrap()
-        };
 
-        let results = refresh_all(conn.clone()).await;
-        assert_eq!(results.len(), 2, "every feed gets an outcome");
+        let first = refresh_feed(conn.clone(), good_id).await.unwrap();
+        assert!(first.error.is_none(), "a good feed reports no error");
+        assert_eq!(first.feed_id, good_id);
+        assert_eq!(first.new_entries, 1, "the feed's one entry is new");
+        assert_eq!(first.http_status, None);
+
+        // The same feed, unchanged: nothing new, still no error.
+        let second = refresh_feed(conn.clone(), good_id).await.unwrap();
+        assert_eq!(second.new_entries, 0, "an unchanged feed adds nothing");
 
         let guard = conn.lock().unwrap();
         let good = db::get_feed(&guard, good_id).unwrap().unwrap();
-        let bad = db::get_feed(&guard, bad_id).unwrap().unwrap();
-
-        assert!(good.last_error.is_none(), "good feed stored without error");
-        assert!(good.last_fetched_at.is_some());
-        assert!(bad.last_error.is_some(), "failed feed records its error");
-        let entries = db::list_all_entries(&guard, "all", db::EntryScope::All).unwrap();
-        assert_eq!(entries.len(), 1, "good feed's entry stored despite sibling failure");
-        assert_eq!(entries[0].feed_id, good_id);
+        assert!(good.last_error.is_none());
+        assert_eq!(good.unread_count, 1);
     }
 
     #[tokio::test]
@@ -365,44 +328,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_folder_touches_only_its_feeds() {
-        let base = serve(vec![("/good.xml", FEED_A.to_string())]);
+    async fn refresh_reports_a_failure_without_failing_the_call() {
         let conn = shared();
-        let folder_id;
-        let in_folder = {
+        // An unroutable port fails fast with no response at all.
+        let bad_id = {
             let guard = conn.lock().unwrap();
-            folder_id = db::create_folder(&guard, "Tech").unwrap().id;
-            let id =
-                db::insert_or_update_feed(&guard, &format!("{base}/good.xml"), "Good", None)
-                    .unwrap();
-            db::move_feed_to_folder(&guard, id, Some(folder_id)).unwrap();
-            id
+            db::insert_or_update_feed(&guard, "http://127.0.0.1:9/bad.xml", "Bad", None).unwrap()
         };
-        let outside = {
+
+        let outcome = refresh_feed(conn.clone(), bad_id).await.unwrap();
+
+        assert_eq!(outcome.feed_id, bad_id);
+        assert!(outcome.error.is_some(), "the reason travels with the result");
+        assert_eq!(outcome.new_entries, 0);
+        assert_eq!(outcome.http_status, None, "no response, so no status");
+
+        let guard = conn.lock().unwrap();
+        let bad = db::get_feed(&guard, bad_id).unwrap().unwrap();
+        assert!(bad.last_error.is_some(), "the failure is recorded on the feed");
+    }
+
+    /// A refusal has to be distinguishable from a broken feed, because the run
+    /// backs the host off instead of reporting each of its feeds as failed.
+    #[tokio::test]
+    async fn refresh_reports_the_response_status_of_a_refusal() {
+        let base = serve_with_status(vec![(
+            "/limited.xml",
+            "429 Too Many Requests",
+            "slow down".to_string(),
+        )]);
+        let conn = shared();
+        let id = {
             let guard = conn.lock().unwrap();
-            db::insert_or_update_feed(&guard, "http://127.0.0.1:9/outside.xml", "Outside", None)
+            db::insert_or_update_feed(&guard, &format!("{base}/limited.xml"), "Limited", None)
                 .unwrap()
         };
 
-        let results = refresh_folder(conn.clone(), folder_id).await.unwrap();
-        assert_eq!(results.len(), 1, "only the folder's feeds get an outcome");
-        assert_eq!(results[0].0, in_folder);
-        assert!(results[0].1.is_ok(), "folder feed refreshed");
+        let outcome = refresh_feed(conn.clone(), id).await.unwrap();
 
-        let guard = conn.lock().unwrap();
-        let inside = db::get_feed(&guard, in_folder).unwrap().unwrap();
-        assert!(inside.last_fetched_at.is_some());
-        let other = db::get_feed(&guard, outside).unwrap().unwrap();
-        assert!(
-            other.last_fetched_at.is_none() && other.last_error.is_none(),
-            "feed outside the folder is never fetched"
-        );
-        drop(guard);
+        assert_eq!(outcome.http_status, Some(429));
+        assert!(outcome.error.is_some(), "the reader still sees why");
+    }
 
-        assert!(
-            refresh_folder(conn.clone(), 999).await.is_err(),
-            "unknown folder rejected"
-        );
+    #[tokio::test]
+    async fn refreshing_an_unknown_feed_is_an_error() {
+        let conn = shared();
+        assert!(refresh_feed(conn, 999).await.is_err());
     }
 
     fn err_str<T>(r: &Result<T, String>) -> String {

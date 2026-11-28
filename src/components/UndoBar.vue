@@ -27,13 +27,8 @@ const emit = defineEmits<{ undo: [] }>();
 
 <style scoped>
 .undo-bar {
-  position: fixed;
-  left: 50%;
-  transform: translateX(-50%);
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 0.75rem);
-  /* Above the panes and the drawer, under the dialogs: a batch that ran from a
-     menu whose dialog closed still shows its undo. */
-  z-index: 25;
+  /* Positioned by the notice stack, which places every short-lived report in
+     one column so an undo offer and a refresh report cannot overlap. */
   display: flex;
   align-items: center;
   gap: 0.75rem;

@@ -8,6 +8,8 @@ import SettingsDialog from "./components/SettingsDialog.vue";
 import KeyboardHelp from "./components/KeyboardHelp.vue";
 import UndoBar from "./components/UndoBar.vue";
 import TouchMenu from "./components/TouchMenu.vue";
+import NoticeStack from "./components/NoticeStack.vue";
+import RefreshPanel from "./components/RefreshPanel.vue";
 import {
   EMPTY_KEY_STATE,
   isEditableTarget,
@@ -25,9 +27,9 @@ import {
   listEntries,
   countEntries,
   getEntry,
-  refreshAll,
   refreshFeed,
-  refreshFolder,
+  starredFeedIds,
+  loadRefreshSettings,
   removeFeed,
   markReadMany,
   setRead,
@@ -41,11 +43,21 @@ import {
   type EntryView,
   type Feed,
   type Folder,
+  type RefreshSettings,
   type Selection,
 } from "./api";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { message } from "@tauri-apps/plugin-dialog";
 import { runBackgroundSync } from "./lib/background-sync";
+import {
+  createRefreshRunner,
+  DEFAULT_CONCURRENCY,
+  dueTargets,
+  TOUCH_CONCURRENCY,
+  type RefreshPanelState,
+  type RefreshProgress,
+  type RefreshSummary,
+  type RefreshTarget,
+} from "./lib/refresh";
 import { useViewport, useMediaQuery, HOVER_MEDIA_QUERY } from "./lib/viewport";
 import { createBackStack, type BackStack } from "./lib/back-stack";
 import type { MenuItem } from "./lib/menu";
@@ -90,7 +102,6 @@ const counts = ref<EntryCounts>({
   starred_entries: 0,
   unread_entries: 0,
 });
-const busy = ref(false);
 const loadError = ref<string | null>(null);
 const editingFeed = ref<Feed | null>(null);
 /** The row whose long-press menu is open, and where it sits in the list. */
@@ -692,44 +703,211 @@ async function toggleStar(entry: { id: number; is_starred: boolean }) {
   }
 }
 
-async function doRefreshAll() {
-  busy.value = true;
-  try {
-    await refreshAll();
-    await reload();
-  } catch (e) {
-    loadError.value = String(e);
-  } finally {
-    busy.value = false;
+/* --- Refresh -------------------------------------------------------------- */
+
+/** How long a run must last before its progress is worth showing. A two-feed
+ *  refresh should not flash a panel. */
+const PANEL_DELAY_MS = 400;
+
+/** How long a clean summary stays before it withdraws. */
+const SUMMARY_LINGER_MS = 4000;
+
+/** How often the schedule looks for feeds whose content has gone stale. */
+const AUTO_TICK_MS = 60_000;
+
+/** The saved schedule. Defaults match the backend's, so a library that has
+ *  never saved one behaves like a fresh install. */
+const refreshSettings = ref<RefreshSettings>({
+  enabled: false,
+  interval_minutes: 30,
+});
+
+/** The run in flight, as the panel needs it: a counter, the finished feeds, and
+ *  the hosts being left alone. Null while nothing runs. */
+const refreshProgress = ref<RefreshProgress | null>(null);
+/** The last finished run, kept until it is dismissed or replaced. */
+const refreshSummary = ref<RefreshSummary | null>(null);
+/** Whether the panel is on screen at all. */
+const panelOpen = ref(false);
+/** True while a run is dispatching, which is what `busy` means to the panes. */
+const refreshRunning = ref(false);
+
+const busy = computed(() => refreshRunning.value);
+
+let panelTimer: ReturnType<typeof setTimeout> | null = null;
+let summaryTimer: ReturnType<typeof setTimeout> | null = null;
+/** A due-eligible check is resolving or running: the schedule and the
+ *  foreground return must not both start one. */
+let dueCheckRunning = false;
+
+/** When the schedule last started a run, for the Settings dialog to report. */
+const lastScheduledAt = ref<string | null>(null);
+
+function clearPanelTimers() {
+  if (panelTimer !== null) {
+    clearTimeout(panelTimer);
+    panelTimer = null;
+  }
+  if (summaryTimer !== null) {
+    clearTimeout(summaryTimer);
+    summaryTimer = null;
   }
 }
 
-async function doRefreshOne(feedId: number) {
-  busy.value = true;
-  try {
-    await refreshFeed(feedId);
-    await reload();
-  } catch (e) {
-    loadError.value = String(e);
-  } finally {
-    busy.value = false;
+function closePanel() {
+  clearPanelTimers();
+  panelOpen.value = false;
+  refreshSummary.value = null;
+  refreshProgress.value = null;
+}
+
+/**
+ * Every trigger reaches this one runner: the list's action, its keystroke, the
+ * pull gesture, the schedule, and the foreground return. It is single-flight
+ * and de-duplicates per feed, so the triggers cannot multiply the work.
+ */
+const refreshRunner = createRefreshRunner({
+  refreshFeed,
+  concurrency: () => (touch.value ? TOUCH_CONCURRENCY : DEFAULT_CONCURRENCY),
+  onStart: (total) => {
+    clearPanelTimers();
+    refreshRunning.value = true;
+    refreshSummary.value = null;
+    refreshProgress.value = {
+      total,
+      done: 0,
+      results: [],
+      backoffs: [],
+      stopping: false,
+    };
+    // A long run announces itself; a short one only reports its summary.
+    panelTimer = setTimeout(() => {
+      panelTimer = null;
+      panelOpen.value = true;
+    }, PANEL_DELAY_MS);
+  },
+  onProgress: (progress) => {
+    refreshProgress.value = progress;
+  },
+  onDone: (summary) => {
+    dueCheckRunning = false;
+    refreshRunning.value = false;
+    refreshProgress.value = null;
+    refreshSummary.value = summary;
+    clearPanelTimers();
+    // The summary outlives the run, so it is shown even when the progress panel
+    // never had time to appear.
+    panelOpen.value = true;
+    if (summary.failed === 0) {
+      summaryTimer = setTimeout(() => {
+        summaryTimer = null;
+        closePanel();
+      }, SUMMARY_LINGER_MS);
+    }
+    if (summary.ok + summary.failed > 0) void reload();
+  },
+});
+
+/** What the panel is showing, when it is showing anything. */
+const panelState = computed<RefreshPanelState | null>(() => {
+  if (refreshProgress.value) return { phase: "running", progress: refreshProgress.value };
+  if (refreshSummary.value) return { phase: "done", summary: refreshSummary.value };
+  return null;
+});
+
+/** The targets a selection's refresh covers. Starred is the only scope that
+ *  needs the backend: which feeds hold a starred entry is not a list the
+ *  frontend has. */
+async function targetsFor(sel: Selection): Promise<RefreshTarget[]> {
+  const toTarget = (feed: Feed): RefreshTarget => ({
+    feedId: feed.id,
+    url: feed.url,
+    lastFetchedAt: feed.last_fetched_at,
+  });
+  switch (sel.kind) {
+    case "all":
+      return feeds.value.map(toTarget);
+    case "feed":
+      return feeds.value.filter((feed) => feed.id === sel.id).map(toTarget);
+    case "folder":
+      return feeds.value.filter((feed) => feed.folder_id === sel.id).map(toTarget);
+    case "starred": {
+      const ids = await starredFeedIds().catch(() => [] as number[]);
+      const starred = new Set(ids);
+      return feeds.value.filter((feed) => starred.has(feed.id)).map(toTarget);
+    }
   }
 }
 
-async function doRefreshFolder(folderId: number) {
-  busy.value = true;
+/**
+ * Start a run for a scope. `due` keeps only the feeds whose content is older
+ * than the interval, which is what the schedule and the foreground return ask
+ * for: refetching a feed fetched a minute ago would only spend the reader's
+ * connection. Returns whether a run started.
+ */
+async function refreshScope(
+  sel: Selection,
+  options: { due?: boolean } = {},
+): Promise<boolean> {
+  let targets: RefreshTarget[];
   try {
-    const outcomes = await refreshFolder(folderId);
-    const failed = outcomes.filter((o) => o.error !== null).length;
-    // window.alert is overridden by tauri-plugin-dialog into a fire-and-forget
-    // call, so await the plugin dialog to keep it in step with the reload.
-    await message(`${outcomes.length - failed} feed(s) refreshed, ${failed} failed`);
-    await reload();
+    targets = await targetsFor(sel);
   } catch (e) {
     loadError.value = String(e);
-  } finally {
-    busy.value = false;
+    return false;
   }
+  if (options.due) {
+    targets = dueTargets(
+      targets,
+      refreshSettings.value.interval_minutes,
+      Date.now(),
+    );
+  }
+  if (targets.length === 0) return false;
+  refreshRunner.start(targets);
+  return true;
+}
+
+function doRefreshAll() {
+  return refreshScope({ kind: "all" });
+}
+
+function doRefreshOne(feedId: number) {
+  return refreshScope({ kind: "feed", id: feedId });
+}
+
+function doRefreshFolder(folderId: number) {
+  return refreshScope({ kind: "folder", id: folderId });
+}
+
+/** The pull gesture: refresh what the list is showing. */
+function refreshCurrentList() {
+  return refreshScope(selection.value);
+}
+
+function stopRefresh() {
+  refreshRunner.cancel();
+}
+
+/** Fetch only the feeds the last run failed on. */
+async function retryFailedFeeds() {
+  const summary = refreshSummary.value;
+  if (!summary) return;
+  const failed = new Set(
+    summary.results.filter((result) => !result.ok).map((result) => result.feedId),
+  );
+  const targets = feeds.value
+    .filter((feed) => failed.has(feed.id))
+    .map<RefreshTarget>((feed) => ({
+      feedId: feed.id,
+      url: feed.url,
+      lastFetchedAt: feed.last_fetched_at,
+    }));
+  if (targets.length === 0) {
+    closePanel();
+    return;
+  }
+  refreshRunner.start(targets);
 }
 
 function onFeedSaved() {
@@ -998,7 +1176,7 @@ function runAction(action: Action, count: number | null) {
       void afterBurst(() => markRenderedRead());
       return;
     case "refresh-all":
-      void afterBurst(doRefreshAll);
+      void afterBurst(() => void doRefreshAll());
       return;
     case "go-all":
       select({ kind: "all" });
@@ -1077,24 +1255,28 @@ let hiddenAt: number | null = null;
 
 /**
  * Refresh what the reader is looking at after the app comes back from the
- * background. Deliberately quieter than the buttons: no summary dialog, so a
- * resume never puts a modal in front of the list. Failures land on the same
- * error line as every other failure.
+ * background, but only the feeds whose content went stale while it was away.
+ * A return is not a reason to refetch a feed that is already fresh, and it is
+ * never a reason for a second run: the guard below keeps a foreground return
+ * and a scheduled check from both starting one.
  */
-async function resumeRefresh() {
-  if (busy.value) return;
-  busy.value = true;
-  try {
-    const sel = selection.value;
-    if (sel.kind === "feed") await refreshFeed(sel.id);
-    else if (sel.kind === "folder") await refreshFolder(sel.id);
-    else await refreshAll();
-    await reload();
-  } catch (e) {
-    loadError.value = String(e);
-  } finally {
-    busy.value = false;
-  }
+async function dueRefresh(sel: Selection) {
+  if (dueCheckRunning) return;
+  dueCheckRunning = true;
+  const started = await refreshScope(sel, { due: true });
+  // The flag is cleared when the run reports its summary; a check that found
+  // nothing due has nothing to wait for.
+  if (!started) dueCheckRunning = false;
+}
+
+/** The scheduled check: only while the app is visible and only for feeds whose
+ *  content is older than the interval. Cheap enough to run every minute,
+ *  because a tick with nothing due sends no request at all. */
+function scheduledCheck() {
+  if (!refreshSettings.value.enabled) return;
+  if (document.visibilityState === "hidden") return;
+  lastScheduledAt.value = new Date().toISOString();
+  void dueRefresh({ kind: "all" });
 }
 
 /**
@@ -1112,7 +1294,7 @@ function onVisibilityChange() {
   if (!narrow.value) return;
   if (hiddenSince === null) return;
   if (Date.now() - hiddenSince < RESUME_REFRESH_MS) return;
-  void resumeRefresh();
+  void dueRefresh(selection.value);
 }
 
 /** Sync in the background, then refresh the view if the library changed.
@@ -1133,15 +1315,34 @@ function onVisibleForSync() {
   if (document.visibilityState === "visible") void syncQuietly();
 }
 
+/** Becoming visible is also when the schedule catches up on what it skipped
+ *  while the app was hidden. */
+function onVisibleForSchedule() {
+  if (document.visibilityState === "visible") scheduledCheck();
+}
+
+let autoTimer: ReturnType<typeof setInterval> | null = null;
+
 onMounted(() => {
   backStack = createBackStack({ onBack: closeTopLayer });
   backStack.sync(openLayers.value.length);
   // Startup sync runs after the first load, so its effects are what the reader
   // sees rather than something the load then overwrites.
   void reload().then(syncQuietly);
+  void loadRefreshSettings()
+    .then((saved) => {
+      if (saved && typeof saved.interval_minutes === "number") {
+        refreshSettings.value = saved;
+      }
+    })
+    .catch(() => {
+      // The default (off) is the safe reading of an unreadable setting.
+    });
+  autoTimer = setInterval(scheduledCheck, AUTO_TICK_MS);
   document.addEventListener("keydown", onKeydown);
   window.addEventListener("focus", onWindowFocus);
   document.addEventListener("visibilitychange", onVisibilityChange);
+  document.addEventListener("visibilitychange", onVisibleForSchedule);
   document.addEventListener("visibilitychange", onVisibleForSync);
   window.addEventListener("blur", flushOnLeave);
   window.addEventListener("beforeunload", flushOnLeave);
@@ -1152,7 +1353,13 @@ onBeforeUnmount(() => {
   backStack = null;
   document.removeEventListener("keydown", onKeydown);
   document.removeEventListener("visibilitychange", onVisibilityChange);
+  document.removeEventListener("visibilitychange", onVisibleForSchedule);
   document.removeEventListener("visibilitychange", onVisibleForSync);
+  if (autoTimer !== null) {
+    clearInterval(autoTimer);
+    autoTimer = null;
+  }
+  clearPanelTimers();
   window.removeEventListener("focus", onWindowFocus);
   window.removeEventListener("blur", flushOnLeave);
   window.removeEventListener("beforeunload", flushOnLeave);
@@ -1213,6 +1420,7 @@ onBeforeUnmount(() => {
       @select="selectEntry"
       @toggle-star="toggleStar"
       @refresh-all="doRefreshAll"
+      @pull-refresh="refreshCurrentList"
       @set-view="setView"
       @load-more="loadMore"
       @mark-rendered="markRenderedRead"
@@ -1246,6 +1454,7 @@ onBeforeUnmount(() => {
     <SettingsDialog
       v-if="settingsOpen"
       :busy="busy"
+      :last-scheduled="lastScheduledAt"
       @close="settingsOpen = false"
       @changed="reload"
     />
@@ -1257,11 +1466,23 @@ onBeforeUnmount(() => {
       @select="chooseRowMenu"
       @close="closeRowMenu"
     />
-    <UndoBar
-      v-if="pendingUndo"
-      :count="pendingUndo.ids.length"
-      @undo="undoBatchRead"
-    />
+    <!-- One stacked region for both reports, so a batch mark's undo offer and
+         a refresh's progress can never cover each other. -->
+    <NoticeStack>
+      <RefreshPanel
+        v-if="panelOpen && panelState"
+        :state="panelState"
+        :titles="feedTitles"
+        @stop="stopRefresh"
+        @retry="retryFailedFeeds"
+        @dismiss="closePanel"
+      />
+      <UndoBar
+        v-if="pendingUndo"
+        :count="pendingUndo.ids.length"
+        @undo="undoBatchRead"
+      />
+    </NoticeStack>
   </main>
 </template>
 

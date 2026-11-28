@@ -8,11 +8,16 @@ import {
   DIRECTION_LOCK,
   DRAG_SLOP,
   EDGE_GUTTER,
+  PULL_MAX_OFFSET,
   beginDrag,
+  beginPull,
   commitDistance,
   dragIntent,
+  pullOffset,
   releaseDrag,
+  releasePull,
   resolveDrag,
+  resolvePull,
   useHorizontalDrag,
   type DragState,
 } from "../lib/gestures";
@@ -401,5 +406,45 @@ describe("useHorizontalDrag", () => {
     press(window, "pointerup", 100, 300);
 
     expect(commits).toEqual([]);
+  });
+});
+
+describe("the pull machine", () => {
+  it("only becomes a pull when the list is already at its top", () => {
+    const atTop = resolvePull(beginPull({ atTop: true }), { dx: 0, dy: 40 });
+    const scrolled = resolvePull(beginPull({ atTop: false }), { dx: 0, dy: 40 });
+
+    expect(atTop.phase).toBe("pulling");
+    expect(scrolled.phase).toBe("ignored");
+  });
+
+  it("stays undecided below the movement slop", () => {
+    const state = resolvePull(beginPull({ atTop: true }), { dx: 0, dy: 3 });
+    expect(state.phase).toBe("pending");
+  });
+
+  it("is not a pull when the movement is sideways", () => {
+    const state = resolvePull(beginPull({ atTop: true }), { dx: 40, dy: 10 });
+    expect(state.phase).toBe("ignored");
+  });
+
+  it("is not a pull when the finger goes up", () => {
+    const state = resolvePull(beginPull({ atTop: true }), { dx: 0, dy: -40 });
+    expect(state.phase).toBe("ignored");
+  });
+
+  it("resists the travel and never passes its cap", () => {
+    const state = resolvePull(beginPull({ atTop: true }), { dx: 0, dy: 100 });
+    expect(pullOffset(state)).toBe(100 * 0.5);
+    const far = resolvePull(beginPull({ atTop: true }), { dx: 0, dy: 10_000 });
+    expect(pullOffset(far)).toBe(PULL_MAX_OFFSET);
+  });
+
+  it("commits only past the threshold", () => {
+    const short = resolvePull(beginPull({ atTop: true }), { dx: 0, dy: 80 });
+    const long = resolvePull(beginPull({ atTop: true }), { dx: 0, dy: 200 });
+
+    expect(releasePull(short)).toBe(false);
+    expect(releasePull(long)).toBe(true);
   });
 });

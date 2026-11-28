@@ -4,7 +4,9 @@ import type {
   EntryScope,
   EntryView,
   Feed,
+  FeedRefresh,
   Folder,
+  RefreshSettings,
   SyncConfig,
   SyncStatus,
 } from "../api";
@@ -49,6 +51,16 @@ export class FakeBackend {
 
   /** The saved WebDAV connection; null means it was never configured. */
   syncConfig: SyncConfig | null = null;
+
+  /** The saved refresh schedule; the default matches `db.rs`. */
+  refreshSettings: RefreshSettings = { enabled: false, interval_minutes: 30 };
+
+  /** Per-feed refresh answers, by feed id. A feed without an entry is
+   *  refreshed successfully with no new entries. Cleared by `resetRefreshes`. */
+  refreshAnswers = new Map<number, Partial<FeedRefresh> | "throw">();
+
+  /** What every refresh of one feed reports, unless overridden above. */
+  defaultRefresh: Partial<FeedRefresh> = {};
 
   /** What the next sync reports. */
   syncOutcome: SyncStatus = {
@@ -181,8 +193,36 @@ export class FakeBackend {
         if (entry) entry.is_starred = args.isStarred === true;
         return null;
       }
-      case "refresh_all":
-        return [];
+      case "refresh_feed": {
+        const feedId = args.feedId as number;
+        const answer = this.refreshAnswers.get(feedId);
+        if (answer === "throw") throw new Error(`refresh of feed ${feedId} failed`);
+        const merged: FeedRefresh = {
+          feed_id: feedId,
+          error: null,
+          new_entries: 0,
+          http_status: null,
+          ...this.defaultRefresh,
+          ...(answer ?? {}),
+        };
+        this.feeds.forEach((feed) => {
+          if (feed.id !== feedId) return;
+          feed.last_fetched_at = new Date().toISOString();
+          feed.last_error = merged.error;
+        });
+        return merged;
+      }
+      case "starred_feed_ids":
+        return [...new Set(
+          this.entries.filter((e) => e.is_starred).map((e) => e.feed_id),
+        )];
+      case "load_refresh_settings":
+        return { ...this.refreshSettings };
+      case "save_refresh_settings": {
+        const settings = args.settings as RefreshSettings;
+        this.refreshSettings = { ...settings };
+        return null;
+      }
       case "load_sync_config":
         return this.syncConfig;
       case "sync_now":

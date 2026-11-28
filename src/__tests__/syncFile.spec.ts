@@ -148,7 +148,7 @@ describe("sync picker filters", () => {
 describe("settings dialog sync actions", () => {
   function mountDialog() {
     return mount(SettingsDialog, {
-      props: { busy: false },
+      props: { busy: false, lastScheduled: null },
       global: { stubs: { teleport: true } },
     });
   }

@@ -8,13 +8,16 @@ import {
   exportSyncDocument,
   importOpml,
   importSyncDocument,
+  loadRefreshSettings,
   loadSyncConfig,
+  saveRefreshSettings,
   saveSyncConfig,
   syncNow,
   syncStatus,
   testSyncConnection,
 } from "../api";
 import type {
+  RefreshSettings,
   SyncConfig,
   SyncImportSummary,
   SyncStatus,
@@ -31,9 +34,11 @@ import {
   writeSyncText,
 } from "../lib/sync-file";
 
-defineProps<{
+const props = defineProps<{
   /** True while a background refresh runs; disables the actions below. */
   busy: boolean;
+  /** When the last scheduled refresh started, or null if none has yet. */
+  lastScheduled: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -43,6 +48,60 @@ const emit = defineEmits<{
 
 /** Success/outcome messages (add feed, folder created, OPML summaries). */
 const notice = ref<string | null>(null);
+
+// --- The refresh schedule -------------------------------------------------
+// Device-local, and saved the moment either control changes: a schedule the
+// reader has to remember to apply is a schedule that does not run.
+const INTERVALS: { minutes: number; label: string }[] = [
+  { minutes: 15, label: "Every 15 minutes" },
+  { minutes: 30, label: "Every 30 minutes" },
+  { minutes: 60, label: "Every hour" },
+  { minutes: 180, label: "Every 3 hours" },
+];
+
+const schedule = ref<RefreshSettings>({ enabled: false, interval_minutes: 30 });
+const scheduleError = ref<string | null>(null);
+
+async function persistSchedule(next: RefreshSettings) {
+  const previous = schedule.value;
+  schedule.value = next;
+  scheduleError.value = null;
+  notice.value = null;
+  try {
+    await saveRefreshSettings(next);
+    notice.value = next.enabled
+      ? `Refreshing every ${next.interval_minutes} minutes`
+      : "Scheduled refresh is off";
+  } catch (e) {
+    // A refused save leaves the control showing what is actually stored.
+    schedule.value = previous;
+    scheduleError.value = String(e);
+  }
+}
+
+function setScheduleEnabled(event: Event) {
+  const enabled = (event.target as HTMLInputElement).checked;
+  void persistSchedule({ ...schedule.value, enabled });
+}
+
+function setScheduleInterval(event: Event) {
+  const interval = Number((event.target as HTMLSelectElement).value);
+  void persistSchedule({ ...schedule.value, interval_minutes: interval });
+}
+
+/** When the schedule will next look for stale feeds. Both lines are read-only:
+ *  the schedule itself runs in the application, and the dialog reports it. */
+const nextScheduledLabel = computed(() => {
+  if (!schedule.value.enabled) return "Scheduled refresh is off";
+  if (props.lastScheduled === null) return "Next check within the interval";
+  const next = Date.parse(props.lastScheduled) + schedule.value.interval_minutes * 60_000;
+  return `Next check ${new Date(next).toLocaleTimeString()}`;
+});
+
+const lastScheduledLabel = computed(() => {
+  if (props.lastScheduled === null) return "No scheduled refresh yet";
+  return `Last scheduled refresh ${new Date(props.lastScheduled).toLocaleTimeString()}`;
+});
 
 // --- Add feed (moved verbatim from Sidebar.vue) ---
 const newUrl = ref("");
@@ -287,6 +346,15 @@ const releaseKeyboard = blockKeyboard();
 onMounted(() => {
   document.addEventListener("keydown", onKey);
   void loadSync();
+  void loadRefreshSettings()
+    .then((saved) => {
+      // A bridge that does not answer with a schedule leaves the default in
+      // place rather than blanking the section.
+      if (saved && typeof saved.interval_minutes === "number") schedule.value = saved;
+    })
+    .catch((e) => {
+      scheduleError.value = String(e);
+    });
 });
 onBeforeUnmount(() => {
   document.removeEventListener("keydown", onKey);
@@ -378,6 +446,33 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <p v-if="syncError" class="dialog-error">{{ syncError }}</p>
+        </section>
+
+        <section class="section">
+          <h3 class="section-title">Refresh</h3>
+          <label class="schedule-switch">
+            <input
+              type="checkbox"
+              :checked="schedule.enabled"
+              :disabled="busy"
+              @change="setScheduleEnabled"
+            />
+            <span>Refresh feeds on a schedule</span>
+          </label>
+          <select
+            class="schedule-interval"
+            aria-label="Refresh interval"
+            :value="schedule.interval_minutes"
+            :disabled="busy || !schedule.enabled"
+            @change="setScheduleInterval"
+          >
+            <option v-for="option in INTERVALS" :key="option.minutes" :value="option.minutes">
+              {{ option.label }}
+            </option>
+          </select>
+          <p class="schedule-status">{{ lastScheduledLabel }}</p>
+          <p class="schedule-status">{{ nextScheduledLabel }}</p>
+          <p v-if="scheduleError" class="dialog-error">{{ scheduleError }}</p>
         </section>
 
         <section class="section">
@@ -522,6 +617,27 @@ onBeforeUnmount(() => {
 .row button:disabled {
   opacity: 0.6;
   cursor: default;
+}
+.schedule-switch {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+.schedule-interval {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  background: #fff;
+}
+.schedule-interval:disabled {
+  opacity: 0.6;
+}
+.schedule-status {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #666;
 }
 .sync-connection {
   display: flex;

@@ -32,7 +32,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ammonia = "4"
 url = "2"
 scraper = "0.20"
-futures = "0.3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-dialog = "2"

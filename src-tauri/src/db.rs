@@ -693,6 +693,53 @@ pub fn save_sync_config(conn: &Connection, config: &SyncConfig) -> Result<(), ru
     Ok(())
 }
 
+/// When the library refreshes itself. Device-local, unlike the library: it
+/// lives in `app_meta`, which never leaves this database, so two installations
+/// may run different schedules without fighting over a shared document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefreshSettings {
+    pub enabled: bool,
+    pub interval_minutes: u32,
+}
+
+/// The intervals the settings offer. A stored value outside this set is
+/// refused on save, so the schedule can never describe something the dialog
+/// cannot show.
+pub const REFRESH_INTERVALS_MINUTES: &[u32] = &[15, 30, 60, 180];
+
+const REFRESH_SETTINGS_KEY: &str = "refresh_settings";
+
+impl Default for RefreshSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: 30,
+        }
+    }
+}
+
+/// The saved schedule, or the default (off, 30 minutes) when none was saved.
+/// A stored value this build cannot parse falls back to the default rather
+/// than failing the dialog the reader cannot fix.
+pub fn load_refresh_settings(conn: &Connection) -> Result<RefreshSettings, String> {
+    let raw = meta_get(conn, REFRESH_SETTINGS_KEY).map_err(|e| e.to_string())?;
+    let Some(raw) = raw else {
+        return Ok(RefreshSettings::default());
+    };
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+pub fn save_refresh_settings(conn: &Connection, settings: &RefreshSettings) -> Result<(), String> {
+    if !REFRESH_INTERVALS_MINUTES.contains(&settings.interval_minutes) {
+        return Err(format!(
+            "unsupported refresh interval: {} minutes",
+            settings.interval_minutes
+        ));
+    }
+    let text = serde_json::to_string(settings).map_err(|e| e.to_string())?;
+    meta_set(conn, REFRESH_SETTINGS_KEY, &text).map_err(|e| e.to_string())
+}
+
 /// Per-remote records are keyed by the resolved document URL, not by "the
 /// connection": a reader who points the settings at a different document must
 /// not inherit the previous one's version, or the first sync against the new
@@ -1334,33 +1381,21 @@ pub fn feed_id_by_url(conn: &Connection, url: &str) -> Result<Option<i64>, rusql
         .optional()
 }
 
-pub fn all_feed_ids_and_urls(conn: &Connection) -> Result<Vec<(i64, String)>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT id, url FROM feeds")?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    rows.collect()
+/// How many entries a feed holds. Used to derive what one store added.
+pub fn count_feed_entries(conn: &Connection, feed_id: i64) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+        params![feed_id],
+        |r| r.get(0),
+    )
 }
 
-/// `(id, url)` for every feed assigned to a folder. Errors when the folder
-/// does not exist.
-pub fn feed_ids_and_urls_in_folder(
-    conn: &Connection,
-    folder_id: i64,
-) -> Result<Vec<(i64, String)>, String> {
-    let exists: i64 = conn
-        .query_row("SELECT COUNT(*) FROM folders WHERE id = ?1", params![folder_id], |r| {
-            r.get(0)
-        })
-        .map_err(|e| e.to_string())?;
-    if exists == 0 {
-        return Err(format!("folder {folder_id} not found"));
-    }
-    let mut stmt = conn
-        .prepare("SELECT id, url FROM feeds WHERE folder_id = ?1")
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![folder_id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+/// Every feed holding at least one starred entry, which is what the Starred
+/// view's refresh covers.
+pub fn starred_feed_ids(conn: &Connection) -> Result<Vec<i64>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT DISTINCT feed_id FROM entries WHERE is_starred = 1")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    rows.collect()
 }
 
 /// Set (Some) or clear (None) a feed's custom display title. Empty or
@@ -2464,21 +2499,89 @@ mod tests {
     }
 
     #[test]
-    fn feed_ids_and_urls_in_folder_lists_only_its_feeds() {
+    fn refresh_settings_default_when_nothing_was_saved() {
         let conn = open_memory().unwrap();
-        let tech = create_folder(&conn, "Tech").unwrap();
+        let settings = load_refresh_settings(&conn).unwrap();
+        assert!(!settings.enabled, "a fresh library does not schedule refreshes");
+        assert_eq!(settings.interval_minutes, 30);
+    }
+
+    #[test]
+    fn refresh_settings_round_trip() {
+        let conn = open_memory().unwrap();
+        let wanted = RefreshSettings {
+            enabled: true,
+            interval_minutes: 60,
+        };
+        save_refresh_settings(&conn, &wanted).unwrap();
+
+        assert_eq!(load_refresh_settings(&conn).unwrap(), wanted);
+    }
+
+    #[test]
+    fn refresh_settings_refuse_an_interval_the_dialog_cannot_show() {
+        let conn = open_memory().unwrap();
+        let bad = RefreshSettings {
+            enabled: true,
+            interval_minutes: 7,
+        };
+        assert!(save_refresh_settings(&conn, &bad).is_err());
+        assert!(
+            !load_refresh_settings(&conn).unwrap().enabled,
+            "a refused save changes nothing"
+        );
+    }
+
+    #[test]
+    fn refresh_settings_survive_a_value_this_build_cannot_read() {
+        let conn = open_memory().unwrap();
+        meta_set(&conn, "refresh_settings", "not json").unwrap();
+        assert_eq!(load_refresh_settings(&conn).unwrap(), RefreshSettings::default());
+    }
+
+    #[test]
+    fn count_feed_entries_counts_one_feed_only() {
+        let conn = open_memory().unwrap();
         let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
         let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
-        move_feed_to_folder(&conn, a, Some(tech.id)).unwrap();
-        // b stays uncategorized.
+        for i in 1..=3 {
+            insert_entry(&conn, a, &format!("g{i}"), "T", None, "<p>x</p>", None).unwrap();
+        }
+        insert_entry(&conn, b, "g1", "T", None, "<p>x</p>", None).unwrap();
 
-        let targets = feed_ids_and_urls_in_folder(&conn, tech.id).unwrap();
-        assert_eq!(targets, vec![(a, "https://a.example/feed".to_string())]);
-        assert!(
-            !targets.iter().any(|(id, _)| *id == b),
-            "uncategorized feed excluded"
-        );
-        assert!(feed_ids_and_urls_in_folder(&conn, 999).is_err(), "unknown folder rejected");
+        assert_eq!(count_feed_entries(&conn, a).unwrap(), 3);
+        assert_eq!(count_feed_entries(&conn, b).unwrap(), 1);
+    }
+
+    #[test]
+    fn starred_feed_ids_lists_each_feed_once() {
+        let conn = open_memory().unwrap();
+        let a = insert_or_update_feed(&conn, "https://a.example/feed", "A", None).unwrap();
+        let b = insert_or_update_feed(&conn, "https://b.example/feed", "B", None).unwrap();
+        insert_entry(&conn, a, "g1", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, a, "g2", "T", None, "<p>x</p>", None).unwrap();
+        insert_entry(&conn, b, "g1", "T", None, "<p>x</p>", None).unwrap();
+        let first: i64 = conn
+            .query_row(
+                "SELECT id FROM entries WHERE feed_id = ?1 AND guid = 'g1'",
+                params![a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let second: i64 = conn
+            .query_row(
+                "SELECT id FROM entries WHERE feed_id = ?1 AND guid = 'g2'",
+                params![a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_entry(&conn, b, "g1", "T", None, "<p>x</p>", None).unwrap();
+
+        assert!(starred_feed_ids(&conn).unwrap().is_empty(), "nothing starred yet");
+        set_starred(&conn, first, true).unwrap();
+        set_starred(&conn, second, true).unwrap();
+
+        assert_eq!(starred_feed_ids(&conn).unwrap(), vec![a], "one row per feed, not per entry");
     }
 
     #[test]

@@ -210,28 +210,39 @@ async fn add_feed(app: tauri::AppHandle, url: String) -> Result<db::FeedDto, Str
     }
 }
 
+/// Refresh one feed. The run — which feeds, in what order, and how many at a
+/// time — is the frontend's decision; this command fetches exactly the feed it
+/// is given and reports what came of it.
 #[tauri::command]
-async fn refresh_feed(app: tauri::AppHandle, feed_id: i64) -> Result<(), String> {
+async fn refresh_feed(app: tauri::AppHandle, feed_id: i64) -> Result<reader::FeedRefresh, String> {
     let conn = shared_conn(&app)?;
     reader::refresh_feed(conn, feed_id).await
 }
 
-/// Refresh every feed under a folder. Per-feed outcomes are included so the
-/// frontend can summarize successes and failures in one alert.
+/// Every feed holding a starred entry, for the Starred view's refresh scope.
 #[tauri::command]
-async fn refresh_folder(
-    app: tauri::AppHandle,
-    folder_id: i64,
-) -> Result<Vec<reader::RefreshOutcome>, String> {
+fn starred_feed_ids(app: tauri::AppHandle) -> Result<Vec<i64>, String> {
     let conn = shared_conn(&app)?;
-    let results = reader::refresh_folder(conn, folder_id).await?;
-    Ok(results
-        .into_iter()
-        .map(|(feed_id, result)| reader::RefreshOutcome {
-            feed_id,
-            error: result.err(),
-        })
-        .collect())
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::starred_feed_ids(&guard).map_err(|e| e.to_string())
+}
+
+/// The refresh schedule, stored with this device's library.
+#[tauri::command]
+fn load_refresh_settings(app: tauri::AppHandle) -> Result<db::RefreshSettings, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::load_refresh_settings(&guard)
+}
+
+#[tauri::command]
+fn save_refresh_settings(
+    app: tauri::AppHandle,
+    settings: db::RefreshSettings,
+) -> Result<(), String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::save_refresh_settings(&guard, &settings)
 }
 
 /// Set or clear a feed's custom display title (`title: null` reverts to the
@@ -245,21 +256,6 @@ fn set_feed_title(
     let conn = shared_conn(&app)?;
     let guard = conn.lock().map_err(|e| e.to_string())?;
     db::set_feed_title(&guard, feed_id, title.as_deref())
-}
-
-/// Refresh all feeds. Never fails as a whole; per-feed outcomes are included
-/// and each feed's error is already recorded in the database.
-#[tauri::command]
-async fn refresh_all(app: tauri::AppHandle) -> Result<Vec<reader::RefreshOutcome>, String> {
-    let conn = shared_conn(&app)?;
-    let results = reader::refresh_all(conn).await;
-    Ok(results
-        .into_iter()
-        .map(|(feed_id, result)| reader::RefreshOutcome {
-            feed_id,
-            error: result.err(),
-        })
-        .collect())
 }
 
 /// The saved WebDAV connection, or `None` when the form has never been filled
@@ -385,8 +381,9 @@ pub fn run() {
             remove_feed,
             add_feed,
             refresh_feed,
-            refresh_all,
-            refresh_folder
+            starred_feed_ids,
+            load_refresh_settings,
+            save_refresh_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -439,6 +436,28 @@ mod tests {
         assert!(error.contains("version 99"), "{error}");
     }
 
+    /// The schedule is this device's business. A sync document carries the
+    /// library, never the preferences of the installation that wrote it.
+    #[test]
+    fn the_refresh_schedule_is_not_part_of_the_sync_document() {
+        let conn = db::open_memory().unwrap();
+        db::save_refresh_settings(
+            &conn,
+            &db::RefreshSettings {
+                enabled: true,
+                interval_minutes: 60,
+            },
+        )
+        .unwrap();
+
+        let text = export_sync_outcome(&conn).unwrap().text;
+
+        assert!(
+            !text.contains("refresh_settings") && !text.contains("interval_minutes"),
+            "the document must not carry the schedule: {text}"
+        );
+    }
+
     /// Registration is the one thing `cargo check` cannot catch: a command that
     /// exists but is missing from the handler simply never runs from the UI.
     #[test]
@@ -450,6 +469,10 @@ mod tests {
             .and_then(|rest| rest.split(']').next())
             .expect("a handler list");
         for command in [
+            "refresh_feed",
+            "starred_feed_ids",
+            "load_refresh_settings",
+            "save_refresh_settings",
             "load_sync_config",
             "save_sync_config",
             "test_sync_connection",

@@ -3,9 +3,50 @@ use crate::rowdetail;
 use chrono::Utc;
 use feed_rs::parser as feed_parser;
 use rusqlite::Connection;
+use std::fmt;
 use std::time::Duration;
 
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A fetch failure, carrying the response status whenever the server answered.
+///
+/// The message is the prose stored on the feed and shown to the reader; the
+/// status is what lets the caller tell a rate-limit refusal apart from a broken
+/// feed, which is why an error cannot be a bare string.
+#[derive(Debug, Clone)]
+pub struct FetchError {
+    pub message: String,
+    pub status: Option<u16>,
+}
+
+impl FetchError {
+    /// A failure that never reached a response: DNS, TLS, timeout, storage.
+    pub fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status: None,
+        }
+    }
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(message: String) -> Self {
+        Self::plain(message)
+    }
+}
+
+/// What one store wrote.
+pub struct StoredFeed {
+    pub feed_id: i64,
+    /// Entries this store inserted that the feed did not hold before.
+    pub new_entries: u32,
+}
 
 /// A parsed feed ready to be stored.
 pub struct ParsedFeed {
@@ -48,26 +89,31 @@ fn describe(error: &dyn std::error::Error) -> String {
 }
 
 /// Fetch a URL and return its bytes plus the final URL after redirects.
-pub async fn fetch_bytes(url: &str) -> Result<(Vec<u8>, String), String> {
+pub async fn fetch_bytes(url: &str) -> Result<(Vec<u8>, String), FetchError> {
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .user_agent("my-timeline-rss/0.1")
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| FetchError::plain(e.to_string()))?;
     let resp = client
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("request failed: {}", describe(&e)))?;
+        .map_err(|e| FetchError::plain(format!("request failed: {}", describe(&e))))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("HTTP {status}"));
+        // The status travels separately so the caller can recognize a refusal
+        // without parsing this message.
+        return Err(FetchError {
+            message: format!("HTTP {status}"),
+            status: Some(status.as_u16()),
+        });
     }
     let final_url = resp.url().to_string();
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| format!("read body failed: {}", describe(&e)))?
+        .map_err(|e| FetchError::plain(format!("read body failed: {}", describe(&e))))?
         .to_vec();
     Ok((bytes, final_url))
 }
@@ -151,13 +197,19 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
     })
 }
 
-/// Store a parsed feed and its entries; returns the feed id.
-pub fn store_feed(conn: &Connection, url: &str, parsed: &ParsedFeed) -> Result<i64, String> {
-    let feed_id = db::insert_or_update_feed(conn, url, &parsed.title, parsed.site_url.as_deref())
+/// Store a parsed feed and its entries; returns what the store wrote.
+///
+/// One transaction covers the feed row, its entries, and the mark application:
+/// a feed is never observable half-stored, and the before/after count of its
+/// entries is exact.
+pub fn store_feed(conn: &Connection, url: &str, parsed: &ParsedFeed) -> Result<StoredFeed, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let feed_id = db::insert_or_update_feed(&tx, url, &parsed.title, parsed.site_url.as_deref())
         .map_err(|e| e.to_string())?;
+    let before = db::count_feed_entries(&tx, feed_id).map_err(|e| e.to_string())?;
     for e in &parsed.entries {
         db::upsert_entry(
-            conn,
+            &tx,
             feed_id,
             &e.guid,
             &e.title,
@@ -169,31 +221,40 @@ pub fn store_feed(conn: &Connection, url: &str, parsed: &ParsedFeed) -> Result<i
         )
         .map_err(|e| e.to_string())?;
     }
+    let after = db::count_feed_entries(&tx, feed_id).map_err(|e| e.to_string())?;
     // A star or read mark can be recorded before its entry arrives. This is the
     // moment the entry does arrive, so the stored intent is applied now.
-    db::apply_marks_to_entries(conn, Some(feed_id)).map_err(|e| e.to_string())?;
-    Ok(feed_id)
+    db::apply_marks_to_entries(&tx, Some(feed_id)).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(StoredFeed {
+        feed_id,
+        new_entries: after.saturating_sub(before) as u32,
+    })
 }
 
-/// Fetch + parse + store for one URL, recording success/failure on the feed row.
-/// Shared by refresh_feed, refresh_all, and add_feed.
+/// Fetch + parse + store for one feed, recording success/failure on the feed
+/// row. Returns how many entries the store added.
 pub async fn fetch_and_store(
     conn: &std::sync::Mutex<Connection>,
     feed_id: i64,
     url: &str,
-) -> Result<(), String> {
+) -> Result<u32, FetchError> {
     let result = async {
         let (bytes, _final_url) = fetch_bytes(url).await?;
-        let parsed = parse_feed(&bytes)?;
-        let conn = conn.lock().map_err(|e| e.to_string())?;
-        store_feed(&conn, url, &parsed).map(|_| ())
+        let parsed = parse_feed(&bytes).map_err(FetchError::plain)?;
+        let guard = conn
+            .lock()
+            .map_err(|e| FetchError::plain(e.to_string()))?;
+        store_feed(&guard, url, &parsed)
+            .map(|stored| stored.new_entries)
+            .map_err(FetchError::plain)
     }
     .await;
 
     let now = Utc::now().to_rfc3339();
-    let error = result.as_ref().err().map(|s| s.as_str());
-    if let Ok(conn) = conn.lock() {
-        let _ = db::set_feed_fetch_result(&conn, feed_id, &now, error);
+    let error = result.as_ref().err().map(|e| e.message.clone());
+    if let Ok(guard) = conn.lock() {
+        let _ = db::set_feed_fetch_result(&guard, feed_id, &now, error.as_deref());
     }
     result
 }
@@ -318,15 +379,66 @@ mod tests {
         let conn = open_memory().unwrap();
         let parsed = parse_feed(FIXTURE.as_bytes()).unwrap();
 
-        let id = store_feed(&conn, "https://fixture.example/rss", &parsed).unwrap();
-        store_feed(&conn, "https://fixture.example/rss", &parsed).unwrap();
+        let first = store_feed(&conn, "https://fixture.example/rss", &parsed).unwrap();
+        let second = store_feed(&conn, "https://fixture.example/rss", &parsed).unwrap();
 
         let entries = list_all_entries(&conn, "all", EntryScope::All).unwrap();
         assert_eq!(entries.len(), 2, "re-storing the same feed must not duplicate");
         let feeds = db::list_feeds(&conn).unwrap();
         assert_eq!(feeds.len(), 1);
-        assert_eq!(feeds[0].id, id);
+        assert_eq!(feeds[0].id, first.feed_id);
         assert_eq!(feeds[0].title, "Fixture Feed");
+        // What the summary in the refresh panel reports.
+        assert_eq!(first.new_entries, 2, "a first store adds every entry");
+        assert_eq!(second.new_entries, 0, "an unchanged re-store adds nothing");
+    }
+
+    #[test]
+    fn store_reports_only_the_entries_it_added() {
+        let conn = open_memory().unwrap();
+        let first = parse_feed(FIXTURE.as_bytes()).unwrap();
+        store_feed(&conn, "https://fixture.example/rss", &first).unwrap();
+
+        // A later fetch that carries one already-stored entry and one new one.
+        let mut grown = parse_feed(FIXTURE.as_bytes()).unwrap();
+        grown.entries.push(ParsedEntry {
+            guid: "post-3".into(),
+            title: "Third post".into(),
+            link: Some("https://fixture.example/3".into()),
+            content_html: "<p>Third</p>".into(),
+            excerpt: "Third".into(),
+            image_url: None,
+            published_at: None,
+        });
+        let stored = store_feed(&conn, "https://fixture.example/rss", &grown).unwrap();
+
+        assert_eq!(stored.new_entries, 1, "only the unfamiliar entry counts");
+        assert_eq!(db::count_feed_entries(&conn, stored.feed_id).unwrap(), 3);
+    }
+
+    /// The whole store is one transaction: a failure part-way leaves neither a
+    /// feed row nor the entries that were written before it.
+    #[test]
+    fn a_failed_store_leaves_nothing_behind() {
+        let conn = open_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_second BEFORE INSERT ON entries
+             WHEN NEW.guid = 'https://fixture.example/2'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+        let parsed = parse_feed(FIXTURE.as_bytes()).unwrap();
+
+        let result = store_feed(&conn, "https://fixture.example/rss", &parsed);
+
+        assert!(result.is_err(), "the injected failure must surface");
+        assert_eq!(db::list_feeds(&conn).unwrap().len(), 0, "no feed row survives");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "the first entry is rolled back too"
+        );
     }
 
     /// `describe` exists because reqwest's top-level message is the same for

@@ -403,13 +403,15 @@ describe("entry and list actions", () => {
     expect(after.every((r) => !r.is_read)).toBe(true);
   });
 
-  it("refreshes all feeds and keeps the loaded rows", async () => {
-    const wrapper = await mountApp({ entries: 30, view: "all" });
+  it("refreshes every feed and keeps the loaded rows", async () => {
+    const wrapper = await mountApp({ entries: 30, view: "all", feeds: 2 });
     const before = rows(wrapper).map((r) => r.id);
 
     await keys("r");
+    await flush();
 
-    expect(backend.countCalls("refresh_all")).toBe(1);
+    // One fetch per feed: the run is orchestrated here, not in the backend.
+    expect(backend.countCalls("refresh_feed")).toBe(2);
     expect(rows(wrapper).map((r) => r.id)).toEqual(before);
   });
 
@@ -751,7 +753,7 @@ describe("gating", () => {
 
     expect(cursorId(wrapper), "no dialog key leaked out").toBeNull();
     expect(entryCalls()).toBe(before);
-    expect(backend.countCalls("refresh_all")).toBe(0);
+    expect(backend.countCalls("refresh_feed")).toBe(0);
   });
 
   it("does not act while a row menu is open", async () => {
@@ -762,7 +764,7 @@ describe("gating", () => {
     await keys("j", "A", "r");
 
     expect(cursorId(wrapper)).toBeNull();
-    expect(backend.countCalls("refresh_all")).toBe(0);
+    expect(backend.countCalls("refresh_feed")).toBe(0);
     expect(markCalls()).toBe(0);
   });
 
@@ -822,7 +824,7 @@ describe("the help overlay", () => {
     await keys("j", "r", "A");
 
     expect(cursorId(wrapper)).toBeNull();
-    expect(backend.countCalls("refresh_all")).toBe(0);
+    expect(backend.countCalls("refresh_feed")).toBe(0);
     expect(markCalls()).toBe(0);
   });
 });

@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import type { EntryListItem } from "../api";
 import { formatRelativeTime, fullTimestamp } from "../lib/time";
-import { useHorizontalDrag } from "../lib/gestures";
+import { useHorizontalDrag, usePullToRefresh } from "../lib/gestures";
 
 const props = defineProps<{
   entries: EntryListItem[];
@@ -37,6 +37,8 @@ const emit = defineEmits<{
   select: [entry: EntryListItem];
   toggleStar: [entry: EntryListItem];
   refreshAll: [];
+  /** Touch layout only: a pull at the top of the list refreshes its scope. */
+  pullRefresh: [];
   setView: [view: "all" | "unread"];
   loadMore: [];
   /** Mark every unread row the list is showing. */
@@ -154,6 +156,29 @@ function onRowPointerDown(
 ) {
   if (!props.touch) return;
   startDrag(event, { key: entry.id });
+}
+
+/**
+ * The pull at the top of the list. It replaces the refresh button on the
+ * one-pane layout, so it is enabled exactly where that button is absent.
+ */
+const {
+  offset: pullOffset,
+  pulling: pullActive,
+  onTouchStart: onListTouchStart,
+  onTouchMove: onListTouchMove,
+  onTouchEnd: onListTouchEnd,
+  onTouchCancel: onListTouchCancel,
+} = usePullToRefresh({
+  enabled: () => props.touch && props.narrow,
+  port: () => listEl.value,
+  onRefresh: () => emit("pullRefresh"),
+});
+
+/** Displacement of the list while it is being pulled. */
+function pullStyle(): Record<string, string> | undefined {
+  if (!pullActive.value && pullOffset.value === 0) return undefined;
+  return { transform: `translateY(${pullOffset.value}px)` };
 }
 
 function sentinelVisible(): boolean {
@@ -295,7 +320,10 @@ function plural(count: number, one: string, many: string): string {
         </button>
       </div>
       <div class="list-actions">
+        <!-- The one-pane layout refreshes by pulling the list instead, so the
+             control is not offered there. -->
         <button
+          v-if="!narrow"
           class="refresh-all"
           :disabled="busy"
           title="Refresh all feeds"
@@ -317,7 +345,15 @@ function plural(count: number, one: string, many: string): string {
       </div>
     </header>
 
-    <ul ref="listEl" class="entries">
+    <ul
+      ref="listEl"
+      class="entries"
+      :style="pullStyle()"
+      @touchstart="onListTouchStart"
+      @touchmove="onListTouchMove"
+      @touchend="onListTouchEnd"
+      @touchcancel="onListTouchCancel"
+    >
       <li
         v-for="(entry, index) in entries"
         :key="entry.id"

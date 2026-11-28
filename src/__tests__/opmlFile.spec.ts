@@ -109,7 +109,7 @@ describe("settings dialog OPML actions", () => {
     // The dialog teleports to <body>; the stub keeps it inside the wrapper so
     // the assertions can address it directly.
     return mount(SettingsDialog, {
-      props: { busy: false },
+      props: { busy: false, lastScheduled: null },
       global: { stubs: { teleport: true } },
     });
   }

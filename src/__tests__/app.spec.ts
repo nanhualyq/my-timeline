@@ -25,8 +25,12 @@ vi.mock("@tauri-apps/api/core", () => ({
     harness.backend.invoke(cmd, args),
 }));
 
+const dialog = vi.hoisted(() => ({
+  message: vi.fn(async () => undefined),
+}));
+
 vi.mock("@tauri-apps/plugin-dialog", () => ({
-  message: async () => undefined,
+  message: dialog.message,
   confirm: async () => true,
   open: async () => null,
   save: async () => null,
@@ -204,6 +208,24 @@ describe("selection and refresh", () => {
       `stale rows leaked in: ${loaded.map((r) => r.feed_id).join(",")}`,
     ).toBe(true);
     expect(list(wrapper).props("hasMore"), "feed 2 still has more").toBe(true);
+  });
+
+  it("reports a folder refresh in the panel instead of a dialog", async () => {
+    const wrapper = await mountApp({ entries: 12, feeds: 2, view: "all" });
+    backend.folders.push({ id: 1, name: "Tech", unread_count: 0, feeds: [] });
+    backend.feeds[1].folder_id = 1;
+    // Pick the assignment up the way the sidebar does after an edit.
+    wrapper.findComponent(Sidebar).vm.$emit("changed");
+    await flush();
+
+    wrapper.findComponent(Sidebar).vm.$emit("refreshFolder", 1);
+    await flush();
+
+    // Only the folder's feed was fetched, and the outcome is a notice rather
+    // than a modal the reader has to dismiss.
+    expect(backend.countCalls("refresh_feed")).toBe(1);
+    expect(wrapper.find(".refresh-panel").exists()).toBe(true);
+    expect(dialog.message).not.toHaveBeenCalled();
   });
 
   it("re-reads the whole loaded window on refresh instead of one batch", async () => {
