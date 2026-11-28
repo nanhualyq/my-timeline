@@ -3,6 +3,7 @@ mod fetch;
 mod opml;
 mod reader;
 mod rowdetail;
+mod sync;
 
 use reader::{AddFeedResult, SharedConn};
 use std::sync::{Arc, Mutex};
@@ -128,6 +129,45 @@ fn export_opml(app: tauri::AppHandle) -> Result<opml::ExportOutcome, String> {
         xml: exported.xml,
         feeds_exported: exported.feeds_exported,
     })
+}
+
+/// Render the shared library state as sync-document text. The frontend writes it
+/// wherever the platform's file picker pointed, exactly as it does for OPML:
+/// only the frontend can turn a desktop path or an Android document reference
+/// into a file.
+#[tauri::command]
+fn export_sync_document(app: tauri::AppHandle) -> Result<sync::ExportOutcome, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    export_sync_outcome(&guard)
+}
+
+/// Merge sync-document text chosen by the frontend into the local library.
+/// Merge-only: it never removes anything the document does not name, and it
+/// performs no fetching — entries arrive through a later refresh.
+#[tauri::command]
+fn import_sync_document(
+    app: tauri::AppHandle,
+    text: String,
+) -> Result<sync::ImportSummary, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    import_sync_outcome(&guard, &text)
+}
+
+/// What both sync commands return, separated from the state lookup only so that
+/// the values crossing the IPC boundary — including the text a document is
+/// rendered to — can be exercised without an application handle. The commands
+/// themselves are the three lines above.
+fn export_sync_outcome(conn: &rusqlite::Connection) -> Result<sync::ExportOutcome, String> {
+    sync::export(conn)
+}
+
+fn import_sync_outcome(
+    conn: &rusqlite::Connection,
+    text: &str,
+) -> Result<sync::ImportSummary, String> {
+    sync::import(conn, text)
 }
 
 #[tauri::command]
@@ -270,6 +310,8 @@ pub fn run() {
             set_starred,
             import_opml,
             export_opml,
+            export_sync_document,
+            import_sync_document,
             remove_feed,
             add_feed,
             refresh_feed,
@@ -278,4 +320,52 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    /// The two commands return these values across the IPC boundary, so the
+    /// tests here check what leaves the process: text that parses back into a
+    /// document, counts the dialog can print, and serializable snapshots.
+    #[test]
+    fn export_returns_text_that_parses_as_a_document() {
+        let conn = db::open_memory().unwrap();
+        let outcome = export_sync_outcome(&conn).unwrap();
+
+        let document: sync::Document = serde_json::from_str(&outcome.text).unwrap();
+        assert_eq!(document.doc_version, sync::DOC_VERSION);
+        assert_eq!(outcome.feeds_exported, 0);
+        assert_eq!(outcome.folders_exported, 0);
+        assert_eq!(outcome.marks_exported, 0);
+
+        let as_ipc: serde_json::Value = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(as_ipc["text"].as_str().unwrap(), outcome.text);
+    }
+
+    #[test]
+    fn importing_an_export_into_an_empty_library_changes_nothing() {
+        let conn = db::open_memory().unwrap();
+        let text = export_sync_outcome(&conn).unwrap().text;
+
+        let summary = import_sync_outcome(&conn, &text).unwrap();
+        assert_eq!(summary.feeds_added, 0);
+        assert_eq!(summary.folders_added, 0);
+        assert_eq!(summary.marks_recorded_for_later, 0);
+        serde_json::to_value(&summary).unwrap();
+    }
+
+    #[test]
+    fn a_document_this_build_cannot_read_reaches_the_ui_as_a_message() {
+        let conn = db::open_memory().unwrap();
+        let error = import_sync_outcome(
+            &conn,
+            r#"{"doc_version": 99, "read_horizon_day": "2026-01-01"}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("version 99"), "{error}");
+    }
 }

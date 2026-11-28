@@ -169,6 +169,9 @@ pub fn store_feed(conn: &Connection, url: &str, parsed: &ParsedFeed) -> Result<i
         )
         .map_err(|e| e.to_string())?;
     }
+    // A star or read mark can be recorded before its entry arrives. This is the
+    // moment the entry does arrive, so the stored intent is applied now.
+    db::apply_marks_to_entries(conn, Some(feed_id)).map_err(|e| e.to_string())?;
     Ok(feed_id)
 }
 

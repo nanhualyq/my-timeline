@@ -174,7 +174,6 @@ export interface ImportOutcome {
   feeds_skipped: number;
   folders_created: number;
 }
-
 export interface ExportOutcome {
   feeds_exported: number;
   /** The rendered document; the frontend writes it where the picker pointed. */
@@ -217,4 +216,94 @@ export function importOpml(xml: string): Promise<ImportOutcome> {
 /** Render every subscription as OPML text and report how many were written. */
 export function exportOpml(): Promise<ExportOutcome> {
   return invoke("export_opml");
+}
+
+// --- Sync document -------------------------------------------------------
+//
+// The portable form of the state more than one installation shares. Entry
+// bodies are absent by design: every installation re-fetches those. Records are
+// keyed by a copyable identity (feed URL, folder uuid) and carry the counter of
+// the edit that set each field, so two copies resolve a conflict without
+// consulting a clock.
+
+export interface SyncFolderRecord {
+  uuid: string;
+  name: string;
+  name_ctr: number;
+  sync_ctr: number;
+}
+
+export interface SyncFeedRecord {
+  url: string;
+  /** The reader's own title; a feed-provided title is re-derived per device. */
+  custom_title?: string | null;
+  title_ctr: number;
+  /** The uuid of the folder the feed is filed under. */
+  folder?: string | null;
+  folder_ctr: number;
+  sync_ctr: number;
+}
+
+export interface SyncMarkRecord {
+  feed: string;
+  guid: string;
+  /** The entry's ordering day, which bounds how long a read mark is shared. */
+  day: string;
+  /** Absent means never set, which is not the same as an explicit false. */
+  read?: boolean | null;
+  read_ctr: number;
+  star?: boolean | null;
+  star_ctr: number;
+}
+
+export interface SyncTombstoneRecord {
+  /** "feed" or "folder". */
+  kind: string;
+  /** The feed URL, or the folder uuid. */
+  key: string;
+  ctr: number;
+  day: string;
+}
+
+export interface SyncDocument {
+  doc_version: number;
+  /** The day before which read marks are not shared. */
+  read_horizon_day: string;
+  folders: SyncFolderRecord[];
+  feeds: SyncFeedRecord[];
+  marks: SyncMarkRecord[];
+  tombstones: SyncTombstoneRecord[];
+  /** Reserved for reader settings; this build neither writes nor reads it. */
+  settings?: unknown;
+}
+
+export interface SyncExportOutcome {
+  /** The rendered document; the frontend writes it where the picker pointed. */
+  text: string;
+  feeds_exported: number;
+  folders_exported: number;
+  marks_exported: number;
+}
+
+export interface SyncImportSummary {
+  folders_added: number;
+  folders_changed: number;
+  folders_removed: number;
+  feeds_added: number;
+  feeds_changed: number;
+  feeds_removed: number;
+  stars_applied: number;
+  read_marks_applied: number;
+  /** Marks kept for entries this installation has not fetched yet. */
+  marks_recorded_for_later: number;
+}
+
+/** Render the shared library state as sync-document text. */
+export function exportSyncDocument(): Promise<SyncExportOutcome> {
+  return invoke("export_sync_document");
+}
+
+/** Merge sync-document text. Merge-only; does not fetch any feed. */
+export function importSyncDocument(text: string): Promise<SyncImportSummary> {
+  return invoke("import_sync_document", { text });
 }

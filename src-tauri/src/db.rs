@@ -1,3 +1,4 @@
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -50,6 +51,17 @@ const COLUMN_MIGRATIONS: &[&str] = &[
     // exactly what the one-time backfill looks for.
     "ALTER TABLE entries ADD COLUMN excerpt TEXT",
     "ALTER TABLE entries ADD COLUMN image_url TEXT",
+    // Shared-state bookkeeping. `uuid` is the identity a folder keeps when it
+    // is copied to another installation; the ids above are local and never
+    // leave this database. Each independently settable field carries the
+    // counter of the edit that set it, so two installations can resolve a
+    // conflict without comparing clocks.
+    "ALTER TABLE folders ADD COLUMN uuid TEXT",
+    "ALTER TABLE folders ADD COLUMN name_ctr INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE folders ADD COLUMN sync_ctr INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE feeds ADD COLUMN sync_ctr INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE feeds ADD COLUMN custom_title_ctr INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE feeds ADD COLUMN folder_ctr INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Indexes that depend on migrated columns.
@@ -61,6 +73,54 @@ CREATE INDEX IF NOT EXISTS idx_entries_starred ON entries(is_starred, published_
 CREATE INDEX IF NOT EXISTS idx_entries_sort
   ON entries(COALESCE(published_at, created_at) DESC, id DESC);
 ";
+
+/// Tables that carry state shared between installations. Created on every open;
+/// every statement is idempotent.
+pub const SYNC_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- One row per entry carrying shared intent. Keyed by the copyable identity
+-- rather than a local id, so a mark can be recorded before the entry itself has
+-- been fetched. read and star are nullable on purpose: NULL means never set,
+-- which is different from an explicit 0 and is what lets a mark-unread made on
+-- one installation survive a merge instead of being reinstated.
+CREATE TABLE IF NOT EXISTS sync_marks (
+    feed_url TEXT NOT NULL,
+    guid TEXT NOT NULL,
+    day TEXT NOT NULL,
+    read INTEGER,
+    read_ctr INTEGER NOT NULL DEFAULT 0,
+    star INTEGER,
+    star_ctr INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (feed_url, guid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_marks_day ON sync_marks(day);
+
+-- Removals. A feed or folder survives a merge only when it was created at a
+-- higher counter than the removal that names it.
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    ctr INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    PRIMARY KEY (kind, key)
+);
+";
+
+/// How long a read mark stays shareable. Stars are exempt.
+pub const READ_WINDOW_DAYS: i64 = 7;
+
+/// How long a removal is remembered. Must outlive the longest realistic gap
+/// between two refreshes of the same library, so an installation that has been
+/// out of use still learns about the removals it missed.
+pub const TOMBSTONE_RETENTION_DAYS: i64 = 90;
+
+pub const TOMBSTONE_FEED: &str = "feed";
+pub const TOMBSTONE_FOLDER: &str = "folder";
 
 /// Create the schema in an already-open connection. Safe to call on every open:
 /// all statements are idempotent and column migrations tolerate being re-run.
@@ -81,6 +141,10 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         [],
     )?;
     conn.execute_batch(POST_MIGRATION)?;
+    conn.execute_batch(SYNC_TABLES)?;
+    backfill_folder_uuids(conn)?;
+    ensure_device_id(conn)?;
+    seed_marks_once(conn)?;
     // Derive row detail for entries stored before those columns existed. Only
     // touches rows whose excerpt is still NULL, so it self-terminates and is
     // safe to call on every open.
@@ -106,6 +170,449 @@ pub fn open_memory() -> Result<Connection, rusqlite::Error> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     init_schema(&conn)?;
     Ok(conn)
+}
+
+// --- Shared-state bookkeeping -------------------------------------------
+
+/// Calendar day, as the short ISO prefix every stored timestamp shares.
+fn today() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+fn days_ago(days: i64) -> String {
+    (Utc::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+fn parse_day(text: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()
+}
+
+/// Give every folder an identity that survives being copied to another
+/// installation, and enforce uniqueness now that none are NULL. Runs on every
+/// open; the `WHERE uuid IS NULL` guard makes it a no-op after the first.
+fn backfill_folder_uuids(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "UPDATE folders SET uuid = 'f-' || lower(hex(randomblob(8))) WHERE uuid IS NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_uuid ON folders(uuid);",
+    )
+}
+
+fn ensure_device_id(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR IGNORE INTO app_meta (key, value)
+         VALUES ('device_id', 'dev-' || lower(hex(randomblob(6))))",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT value FROM app_meta WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// This installation's identity. Written once and then stable for the life of
+/// the database; it names the writer of a document for diagnostics and never
+/// decides a merge.
+// Only the tests read it today; a transport will name the writer with it.
+#[allow(dead_code)]
+pub fn device_id(conn: &Connection) -> Result<String, rusqlite::Error> {
+    meta_get(conn, "device_id")?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Hand out the next ordering value. Every shareable local edit takes one, so
+/// values are unique per field and comparable across installations without
+/// either side consulting a clock.
+pub fn next_counter(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "INSERT INTO app_meta (key, value) VALUES ('counter', '1')
+         ON CONFLICT(key) DO UPDATE
+           SET value = CAST(CAST(app_meta.value AS INTEGER) + 1 AS TEXT)
+         RETURNING CAST(value AS INTEGER)",
+        [],
+        |r| r.get(0),
+    )
+}
+
+/// Raise the counter above every value an imported document carried, so an edit
+/// made after seeing those values outranks them everywhere.
+pub fn raise_counter(conn: &Connection, floor: i64) -> Result<(), rusqlite::Error> {
+    if floor <= 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES ('counter', CAST(?1 AS TEXT))
+         ON CONFLICT(key) DO UPDATE
+           SET value = CAST(MAX(CAST(app_meta.value AS INTEGER), ?1) AS TEXT)",
+        params![floor],
+    )?;
+    Ok(())
+}
+
+/// The day before which read marks are no longer shared. It is stored rather
+/// than recomputed so that two installations reading the same document agree on
+/// the window: `today - 7d` evaluated separately on each device would make every
+/// merge look like a change.
+///
+/// The advance is capped at one day per call, so a device whose clock is far
+/// ahead can never jump the horizon forward and discard marks that another
+/// device, and its reader, still consider current.
+pub fn advance_read_horizon(
+    conn: &Connection,
+    observed: Option<&str>,
+) -> Result<String, rusqlite::Error> {
+    let current = meta_get(conn, "read_horizon_day")?;
+    let mut target = days_ago(READ_WINDOW_DAYS);
+    // Only a well-formed date is accepted from a document, which also keeps the
+    // value safe to interpolate into statements further down.
+    if let Some(day) = observed.filter(|d| parse_day(d).is_some()) {
+        if day > target.as_str() {
+            target = day.to_string();
+        }
+    }
+    if let Some(day) = current.as_deref() {
+        if day > target.as_str() {
+            target = day.to_string();
+        }
+    }
+    if let Some(day) = current.as_deref().and_then(parse_day) {
+        let cap = (day + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        if target > cap {
+            target = cap;
+        }
+    }
+    if current.as_deref() != Some(target.as_str()) {
+        meta_set(conn, "read_horizon_day", &target)?;
+    }
+    Ok(target)
+}
+
+/// One row of the intent ledger.
+#[derive(Debug, Clone, Serialize)]
+pub struct MarkRow {
+    pub feed_url: String,
+    pub guid: String,
+    /// The entry's ordering day, used for the read window.
+    pub day: String,
+    pub read: Option<bool>,
+    pub read_ctr: i64,
+    pub star: Option<bool>,
+    pub star_ctr: i64,
+}
+
+/// Entry ordering day: the same expression the list pages by, truncated to a
+/// calendar day so the read window can be applied to it.
+const DAY_EXPR: &str = "substr(COALESCE(e.published_at, e.created_at), 1, 10)";
+
+/// Record one entry's read state, or change nothing when the incoming value is
+/// not newer than the stored one. Returns whether anything changed, which is
+/// what makes re-importing the same document report no changes.
+pub fn write_mark_read(
+    conn: &Connection,
+    feed_url: &str,
+    guid: &str,
+    day: &str,
+    read: Option<bool>,
+    ctr: i64,
+) -> Result<bool, rusqlite::Error> {
+    let changed = conn.execute(
+        "INSERT INTO sync_marks (feed_url, guid, day, read, read_ctr)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(feed_url, guid) DO UPDATE SET
+             day = excluded.day,
+             read = excluded.read,
+             read_ctr = excluded.read_ctr
+         WHERE excluded.read_ctr > sync_marks.read_ctr
+            OR (excluded.read_ctr = sync_marks.read_ctr
+                AND sync_marks.read IS NOT excluded.read)",
+        params![feed_url, guid, day, read.map(|b| b as i64), ctr],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Star counterpart of `write_mark_read`.
+pub fn write_mark_star(
+    conn: &Connection,
+    feed_url: &str,
+    guid: &str,
+    day: &str,
+    star: Option<bool>,
+    ctr: i64,
+) -> Result<bool, rusqlite::Error> {
+    let changed = conn.execute(
+        "INSERT INTO sync_marks (feed_url, guid, day, star, star_ctr)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(feed_url, guid) DO UPDATE SET
+             day = excluded.day,
+             star = excluded.star,
+             star_ctr = excluded.star_ctr
+         WHERE excluded.star_ctr > sync_marks.star_ctr
+            OR (excluded.star_ctr = sync_marks.star_ctr
+                AND sync_marks.star IS NOT excluded.star)",
+        params![feed_url, guid, day, star.map(|b| b as i64), ctr],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn marks_all(conn: &Connection) -> Result<Vec<MarkRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT feed_url, guid, day, read, read_ctr, star, star_ctr
+         FROM sync_marks ORDER BY day, feed_url, guid",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(MarkRow {
+            feed_url: r.get(0)?,
+            guid: r.get(1)?,
+            day: r.get(2)?,
+            read: r.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+            read_ctr: r.get(4)?,
+            star: r.get::<_, Option<i64>>(5)?.map(|v| v != 0),
+            star_ctr: r.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn prune_marks(conn: &Connection, horizon: &str) -> Result<usize, rusqlite::Error> {
+    // A row that ever carried a star is kept forever: stars never expire, and
+    // dropping the row would let another installation's older star record
+    // reinstate a star the reader removed.
+    conn.execute(
+        "DELETE FROM sync_marks WHERE day < ?1 AND star IS NULL",
+        params![horizon],
+    )
+}
+
+/// Apply stored intent to the entries that exist locally. Rows whose state
+/// would not change are left alone, so this is cheap enough to run after every
+/// fetch as well as after an import.
+pub fn apply_marks_to_entries(
+    conn: &Connection,
+    feed_id: Option<i64>,
+) -> Result<usize, rusqlite::Error> {
+    let scope = if feed_id.is_some() { " AND f.id = ?1" } else { "" };
+    let sql = format!(
+        "UPDATE entries AS e
+         SET is_read = COALESCE(m.read, e.is_read),
+             is_starred = COALESCE(m.star, e.is_starred)
+         FROM sync_marks m JOIN feeds f ON f.url = m.feed_url
+         WHERE e.feed_id = f.id AND e.guid = m.guid
+           AND (COALESCE(m.read, e.is_read) <> e.is_read
+                OR COALESCE(m.star, e.is_starred) <> e.is_starred){scope}"
+    );
+    match feed_id {
+        Some(id) => conn.execute(&sql, params![id]),
+        None => conn.execute(&sql, []),
+    }
+}
+
+/// The copyable identity and ordering day of one entry.
+fn entry_mark_key(
+    conn: &Connection,
+    entry_id: i64,
+) -> Result<Option<(String, String, String)>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT f.url, e.guid, substr(COALESCE(e.published_at, e.created_at), 1, 10)
+         FROM entries e JOIN feeds f ON f.id = e.feed_id WHERE e.id = ?1",
+        params![entry_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+}
+
+/// Record a single entry's read state. Entries already outside the window are
+/// left out at write time rather than pruned later, so the ledger never fills
+/// with rows that are discarded within hours.
+fn record_read_mark(conn: &Connection, entry_id: i64, is_read: bool) -> Result<(), String> {
+    let horizon = advance_read_horizon(conn, None).map_err(|e| e.to_string())?;
+    let Some((feed_url, guid, day)) = entry_mark_key(conn, entry_id).map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    if day < horizon {
+        return Ok(());
+    }
+    let ctr = next_counter(conn).map_err(|e| e.to_string())?;
+    write_mark_read(conn, &feed_url, &guid, &day, Some(is_read), ctr)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn record_star_mark(conn: &Connection, entry_id: i64, is_starred: bool) -> Result<(), String> {
+    let Some((feed_url, guid, day)) = entry_mark_key(conn, entry_id).map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let ctr = next_counter(conn).map_err(|e| e.to_string())?;
+    write_mark_star(conn, &feed_url, &guid, &day, Some(is_starred), ctr)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Bulk counterpart of `record_read_mark`, for the batch actions. One statement
+/// per batch instead of one per row: marking a scope read can touch thousands of
+/// entries. `ctr` and `horizon` are formatted rather than bound because a bare
+/// `?` that appears before this statement's WHERE clause would renumber the
+/// scope conditions' placeholders; both values are integers and a parsed date.
+fn record_read_marks_for_where(
+    conn: &Connection,
+    conditions: &str,
+    params: &[Param],
+    ctr: i64,
+    horizon: &str,
+) -> Result<usize, String> {
+    let sql = format!(
+        "INSERT INTO sync_marks (feed_url, guid, day, read, read_ctr)
+         SELECT f.url, e.guid, {day}, 1, {ctr}
+         FROM entries e JOIN feeds f ON f.id = e.feed_id
+         WHERE e.is_read = 1 AND {day} >= '{horizon}'{conditions}
+         ON CONFLICT(feed_url, guid) DO UPDATE SET
+             read = 1, read_ctr = excluded.read_ctr
+         WHERE excluded.read_ctr > sync_marks.read_ctr",
+        day = DAY_EXPR,
+        ctr = ctr,
+        horizon = horizon,
+        conditions = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {conditions}")
+        },
+    );
+    let refs = bind_refs(params);
+    conn.execute(&sql, refs.as_slice())
+        .map_err(|e| e.to_string())
+}
+
+fn record_read_marks_for_ids(conn: &Connection, ids: &[i64]) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let horizon = advance_read_horizon(conn, None).map_err(|e| e.to_string())?;
+    let ctr = next_counter(conn).map_err(|e| e.to_string())?;
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let conditions = format!("e.id IN ({placeholders})");
+    let params: Vec<Param> = ids.iter().map(|id| Box::new(*id) as Param).collect();
+    record_read_marks_for_where(conn, &conditions, &params, ctr, &horizon)
+}
+
+/// One-time seed of the ledger from the entries that predate it. Without it the
+/// ledger and the entry columns would disagree from the first import onward, and
+/// the reader's existing stars would look like they were dropped. Seeded rows
+/// carry counter 0 — the weakest possible — so any real edit or import outranks
+/// them.
+fn seed_marks_once(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if meta_get(conn, "marks_seeded")?.is_some() {
+        return Ok(());
+    }
+    let horizon = days_ago(READ_WINDOW_DAYS);
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO sync_marks
+                 (feed_url, guid, day, read, read_ctr, star, star_ctr)
+             SELECT f.url, e.guid, {day}, e.is_read, 0, e.is_starred, 0
+             FROM entries e JOIN feeds f ON f.id = e.feed_id
+             WHERE (e.is_read = 1 AND {day} >= '{horizon}') OR e.is_starred = 1",
+            day = DAY_EXPR,
+            horizon = horizon,
+        ),
+        [],
+    )?;
+    // Read marks older than the window are skipped, but every starred entry is
+    // seeded regardless of age, because stars never expire.
+    meta_set(conn, "marks_seeded", &horizon)?;
+    Ok(())
+}
+
+/// One remembered removal.
+#[derive(Debug, Clone, Serialize)]
+pub struct TombstoneRow {
+    pub kind: String,
+    pub key: String,
+    pub ctr: i64,
+    pub day: String,
+}
+
+/// Record (or strengthen) a removal. Imported documents carry their own day, so
+/// the fields are parameters rather than the local clock.
+pub fn raise_tombstone(
+    conn: &Connection,
+    kind: &str,
+    key: &str,
+    ctr: i64,
+    day: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO sync_tombstones (kind, key, ctr, day) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(kind, key) DO UPDATE SET
+             ctr = MAX(sync_tombstones.ctr, excluded.ctr),
+             day = MAX(sync_tombstones.day, excluded.day)",
+        params![kind, key, ctr, day],
+    )?;
+    Ok(())
+}
+
+fn record_tombstone(conn: &Connection, kind: &str, key: &str) -> Result<i64, rusqlite::Error> {
+    let ctr = next_counter(conn)?;
+    raise_tombstone(conn, kind, key, ctr, &today())?;
+    Ok(ctr)
+}
+
+pub fn tombstones_all(conn: &Connection) -> Result<Vec<TombstoneRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, key, ctr, day FROM sync_tombstones ORDER BY kind, key",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(TombstoneRow {
+            kind: r.get(0)?,
+            key: r.get(1)?,
+            ctr: r.get(2)?,
+            day: r.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Drop removals old enough that every installation has had a chance to see
+/// them, so the document does not grow without bound.
+pub fn prune_tombstones(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM sync_tombstones WHERE day < ?1",
+        params![days_ago(TOMBSTONE_RETENTION_DAYS)],
+    )
+}
+
+/// The counter of the removal recorded for a feed URL or folder identity, or 0
+/// when there is none.
+pub fn tombstone_ctr(
+    conn: &Connection,
+    kind: &str,
+    key: &str,
+) -> Result<i64, rusqlite::Error> {
+    Ok(conn
+        .query_row(
+            "SELECT ctr FROM sync_tombstones WHERE kind = ?1 AND key = ?2",
+            params![kind, key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,10 +668,16 @@ pub fn insert_or_update_feed(
     title: &str,
     site_url: Option<&str>,
 ) -> Result<i64, rusqlite::Error> {
+    // Only a genuinely new row takes a counter: the conflict path must not
+    // inflate the sequence on every refresh.
+    let sync_ctr = match feed_id_by_url(conn, url)? {
+        Some(_) => 0,
+        None => next_counter(conn)?,
+    };
     conn.execute(
-        "INSERT INTO feeds (url, title, site_url) VALUES (?1, ?2, ?3)
+        "INSERT INTO feeds (url, title, site_url, sync_ctr) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(url) DO UPDATE SET title = ?2, site_url = COALESCE(?3, site_url)",
-        params![url, title, site_url],
+        params![url, title, site_url, sync_ctr],
     )?;
     conn.query_row("SELECT id FROM feeds WHERE url = ?1", params![url], |r| {
         r.get(0)
@@ -476,7 +989,10 @@ pub fn set_read(
     entry_id: i64,
     is_read: bool,
 ) -> Result<(), String> {
-    let n = conn
+    // The entry column and the ledger row move together: the column is what the
+    // list reads, the ledger is what another installation receives.
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let n = tx
         .execute(
             "UPDATE entries SET is_read = ?1 WHERE id = ?2",
             params![is_read as i64, entry_id],
@@ -485,7 +1001,8 @@ pub fn set_read(
     if n == 0 {
         return Err(format!("entry {entry_id} not found"));
     }
-    Ok(())
+    record_read_mark(&tx, entry_id, is_read)?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Ids per statement when marking a batch read. Deep scrolling can leave
@@ -512,6 +1029,7 @@ pub fn mark_read_many(conn: &Connection, ids: &[i64]) -> Result<i64, String> {
             chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
         changed += tx.execute(&sql, params.as_slice()).map_err(|e| e.to_string())? as i64;
     }
+    record_read_marks_for_ids(&tx, ids)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(changed)
 }
@@ -520,15 +1038,30 @@ pub fn mark_read_many(conn: &Connection, ids: &[i64]) -> Result<i64, String> {
 /// listed. Shares `filter_conditions` with listing and counting, so the rows
 /// touched are exactly the ones the unread view would have shown.
 pub fn mark_scope_read(conn: &Connection, scope: EntryScope) -> Result<i64, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let (conditions, params) = filter_conditions("unread", scope)?;
     let sql = format!(
         "UPDATE entries SET is_read = 1 {}",
         where_clause(&conditions)
     );
     let refs = bind_refs(&params);
-    let changed = conn
+    let changed = tx
         .execute(&sql, refs.as_slice())
         .map_err(|e| e.to_string())?;
+    // The whole scope is shared, not just the rows that just flipped: entries
+    // read earlier are already in the ledger and the guarded insert leaves them
+    // alone, while the ones that just changed are now due.
+    let (rec_conditions, rec_params) = filter_conditions("all", scope)?;
+    let horizon = advance_read_horizon(&tx, None).map_err(|e| e.to_string())?;
+    let ctr = next_counter(&tx).map_err(|e| e.to_string())?;
+    record_read_marks_for_where(
+        &tx,
+        &rec_conditions.join(" AND "),
+        &rec_params,
+        ctr,
+        &horizon,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(changed as i64)
 }
 
@@ -538,7 +1071,8 @@ pub fn set_starred(
     entry_id: i64,
     is_starred: bool,
 ) -> Result<(), String> {
-    let n = conn
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let n = tx
         .execute(
             "UPDATE entries SET is_starred = ?1 WHERE id = ?2",
             params![is_starred as i64, entry_id],
@@ -547,7 +1081,8 @@ pub fn set_starred(
     if n == 0 {
         return Err(format!("entry {entry_id} not found"));
     }
-    Ok(())
+    record_star_mark(&tx, entry_id, is_starred)?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Aggregate counts for the global sidebar rows.
@@ -580,11 +1115,24 @@ pub fn entry_counts(conn: &Connection) -> Result<EntryCountsDto, rusqlite::Error
     )
 }
 
-/// Delete a feed; entries cascade (verified by schema test).
+/// Delete a feed; entries cascade (verified by schema test). The removal is
+/// recorded as a tombstone first, so it propagates instead of being undone by an
+/// installation that has not seen it yet. Keeping the delete itself hard leaves
+/// every existing query untouched.
 pub fn delete_feed(conn: &Connection, feed_id: i64) -> Result<(), String> {
-    conn.execute("DELETE FROM feeds WHERE id = ?1", params![feed_id])
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let url: Option<String> = tx
+        .query_row("SELECT url FROM feeds WHERE id = ?1", params![feed_id], |r| {
+            r.get(0)
+        })
+        .optional()
         .map_err(|e| e.to_string())?;
-    Ok(())
+    tx.execute("DELETE FROM feeds WHERE id = ?1", params![feed_id])
+        .map_err(|e| e.to_string())?;
+    if let Some(url) = url {
+        record_tombstone(&tx, TOMBSTONE_FEED, &url).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Record the outcome of a refresh attempt for one feed.
@@ -667,10 +1215,11 @@ pub fn feed_ids_and_urls_in_folder(
 /// subsequent fetches keep updating it while the display prefers the custom one.
 pub fn set_feed_title(conn: &Connection, feed_id: i64, title: Option<&str>) -> Result<(), String> {
     let custom = title.map(str::trim).filter(|t| !t.is_empty());
+    let ctr = next_counter(conn).map_err(|e| e.to_string())?;
     let n = conn
         .execute(
-            "UPDATE feeds SET custom_title = ?1 WHERE id = ?2",
-            params![custom, feed_id],
+            "UPDATE feeds SET custom_title = ?1, custom_title_ctr = ?3 WHERE id = ?2",
+            params![custom, feed_id, ctr],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {
@@ -685,8 +1234,13 @@ pub fn create_folder(conn: &Connection, name: &str) -> Result<FolderDto, String>
     if name.is_empty() {
         return Err("folder name is empty".into());
     }
-    conn.execute("INSERT INTO folders (name) VALUES (?1)", params![name])
-        .map_err(|e| e.to_string())?;
+    let ctr = next_counter(conn).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO folders (name, uuid, sync_ctr)
+         VALUES (?1, 'f-' || lower(hex(randomblob(8))), ?2)",
+        params![name, ctr],
+    )
+    .map_err(|e| e.to_string())?;
     let id = conn
         .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
@@ -699,10 +1253,11 @@ pub fn rename_folder(conn: &Connection, folder_id: i64, name: &str) -> Result<()
     if name.is_empty() {
         return Err("folder name is empty".into());
     }
+    let ctr = next_counter(conn).map_err(|e| e.to_string())?;
     let n = conn
         .execute(
-            "UPDATE folders SET name = ?1 WHERE id = ?2",
-            params![name, folder_id],
+            "UPDATE folders SET name = ?1, name_ctr = ?3 WHERE id = ?2",
+            params![name, folder_id, ctr],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {
@@ -715,6 +1270,12 @@ pub fn rename_folder(conn: &Connection, folder_id: i64, name: &str) -> Result<()
 /// feeds and entries are never removed by this operation.
 pub fn delete_folder(conn: &Connection, folder_id: i64) -> Result<(), String> {
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let uuid: Option<String> = tx
+        .query_row("SELECT uuid FROM folders WHERE id = ?1", params![folder_id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
     tx.execute(
         "UPDATE feeds SET folder_id = NULL WHERE folder_id = ?1",
         params![folder_id],
@@ -725,6 +1286,9 @@ pub fn delete_folder(conn: &Connection, folder_id: i64) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     if n == 0 {
         return Err(format!("folder {folder_id} not found"));
+    }
+    if let Some(uuid) = uuid {
+        record_tombstone(&tx, TOMBSTONE_FOLDER, &uuid).map_err(|e| e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())
 }
@@ -748,10 +1312,11 @@ pub fn move_feed_to_folder(
             return Err(format!("folder {fid} not found"));
         }
     }
+    let ctr = next_counter(conn).map_err(|e| e.to_string())?;
     let n = conn
         .execute(
-            "UPDATE feeds SET folder_id = ?1 WHERE id = ?2",
-            params![folder_id, feed_id],
+            "UPDATE feeds SET folder_id = ?1, folder_ctr = ?3 WHERE id = ?2",
+            params![folder_id, feed_id, ctr],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {
@@ -1857,5 +2422,341 @@ mod tests {
         })
         .unwrap()
             != 0
+    }
+
+    // --- Shared-state bookkeeping ---------------------------------------
+
+    /// An RFC3339 timestamp `days` before now. Tests derive their dates from
+    /// the clock so the read window they exercise is always current.
+    fn stamp_days_ago(days: i64) -> String {
+        (Utc::now() - chrono::Duration::days(days)).to_rfc3339()
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    fn entry_id(conn: &Connection, guid: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM entries WHERE guid = ?1",
+            params![guid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn feed_sync_ctr(conn: &Connection, feed_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT sync_ctr FROM feeds WHERE id = ?1",
+            params![feed_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn folder_fields(conn: &Connection, folder_id: i64) -> (String, i64, i64) {
+        conn.query_row(
+            "SELECT uuid, sync_ctr, name_ctr FROM folders WHERE id = ?1",
+            params![folder_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// The three shared-state fields of a feed, in the order they are compared.
+    fn feed_counters(conn: &Connection, feed_id: i64) -> (i64, i64) {
+        conn.query_row(
+            "SELECT custom_title_ctr, folder_ctr FROM feeds WHERE id = ?1",
+            params![feed_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn schema_creates_the_shared_state_tables() {
+        let conn = open_memory().unwrap();
+        for name in ["app_meta", "sync_marks", "sync_tombstones"] {
+            assert!(table_exists(&conn, name), "{name} must exist");
+        }
+    }
+
+    #[test]
+    fn folders_get_a_distinct_uuid_when_an_older_database_is_migrated() {
+        // The schema as it shipped before shared state existed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE folders (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO folders (name) VALUES ('Tech'), ('Tech')", [])
+            .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let uuids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT uuid FROM folders ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(uuids.len(), 2);
+        assert!(uuids.iter().all(|u| !u.is_empty()), "every folder needs an identity");
+        assert_ne!(uuids[0], uuids[1], "two folders sharing a name stay distinct");
+    }
+
+    #[test]
+    fn shared_counters_default_to_zero_on_rows_stored_before_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE feeds (id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE,
+                                 title TEXT NOT NULL, site_url TEXT,
+                                 last_fetched_at TEXT, last_error TEXT);
+             INSERT INTO feeds (url, title) VALUES ('https://a.example/feed', 'A');",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let ctr: i64 = conn
+            .query_row("SELECT sync_ctr FROM feeds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ctr, 0, "a pre-existing feed has the weakest ordering value");
+    }
+
+    #[test]
+    fn device_id_is_stable_and_counters_increase() {
+        let dir = std::env::temp_dir().join(format!("rss-device-test-{}", std::process::id()));
+        let path = dir.join("reader.db");
+        let _ = std::fs::remove_file(&path);
+
+        let first = {
+            let conn = open(&path).unwrap();
+            device_id(&conn).unwrap()
+        };
+        let second = {
+            let conn = open(&path).unwrap();
+            device_id(&conn).unwrap()
+        };
+        assert_eq!(first, second, "the identity is written once and then stable");
+
+        let conn = open(&path).unwrap();
+        let a = next_counter(&conn).unwrap();
+        let b = next_counter(&conn).unwrap();
+        assert_eq!(b, a + 1, "every edit takes a strictly higher value");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folders_created_with_the_same_name_get_distinct_identities() {
+        let conn = open_memory().unwrap();
+        let a = create_folder(&conn, "Tech").unwrap();
+        let b = create_folder(&conn, "Tech").unwrap();
+        let (uuid_a, ctr_a, _) = folder_fields(&conn, a.id);
+        let (uuid_b, ctr_b, _) = folder_fields(&conn, b.id);
+        assert_ne!(uuid_a, uuid_b, "matching by name would merge two real folders");
+        assert!(ctr_b > ctr_a);
+    }
+
+    #[test]
+    fn each_shared_feed_field_carries_its_own_counter() {
+        let conn = open_memory().unwrap();
+        let folder = create_folder(&conn, "Tech").unwrap();
+        let feed = insert_feed(&conn, "a");
+        let before = feed_counters(&conn, feed);
+
+        set_feed_title(&conn, feed, Some("Mine")).unwrap();
+        let after_title = feed_counters(&conn, feed);
+        assert!(after_title.0 > before.0, "the title edit is stamped");
+        assert_eq!(after_title.1, before.1, "an unrelated field is left alone");
+
+        move_feed_to_folder(&conn, feed, Some(folder.id)).unwrap();
+        let after_folder = feed_counters(&conn, feed);
+        assert!(after_folder.1 > after_title.1, "the folder edit is stamped");
+        assert_eq!(after_folder.0, after_title.0, "the title stamp is unchanged");
+    }
+
+    #[test]
+    fn marks_carry_the_entry_ordering_day_and_prune_by_it() {
+        let conn = open_memory().unwrap();
+        let feed = insert_feed(&conn, "a");
+        let published = stamp_days_ago(0);
+        insert_entry(&conn, feed, "g1", "T", None, "<p>x</p>", Some(&published)).unwrap();
+        let id = entry_id(&conn, "g1");
+        set_read(&conn, id, true).unwrap();
+
+        let day: String = conn
+            .query_row("SELECT day FROM sync_marks WHERE guid = 'g1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(day, &published[..10], "the day is the entry's ordering day");
+
+        // A mark from long ago is what pruning is for.
+        write_mark_read(&conn, "https://a.example/feed", "ancient", "2000-01-01", Some(true), 99)
+            .unwrap();
+        assert_eq!(prune_marks(&conn, &days_ago(READ_WINDOW_DAYS)).unwrap(), 1);
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_marks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "only the mark inside the window survives");
+    }
+
+    #[test]
+    fn a_mark_for_an_absent_entry_is_applied_when_it_arrives() {
+        let conn = open_memory().unwrap();
+        let feed = insert_feed(&conn, "a");
+        let url = "https://a.example/feed";
+
+        write_mark_star(&conn, url, "later", &days_ago(0), Some(true), 5).unwrap();
+        assert_eq!(
+            apply_marks_to_entries(&conn, None).unwrap(),
+            0,
+            "there is no entry to apply it to yet"
+        );
+
+        let published = stamp_days_ago(0);
+        insert_entry(&conn, feed, "later", "T", None, "<p>x</p>", Some(&published)).unwrap();
+        assert_eq!(apply_marks_to_entries(&conn, Some(feed)).unwrap(), 1);
+
+        let starred: i64 = conn
+            .query_row("SELECT is_starred FROM entries WHERE guid = 'later'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(starred, 1, "the mark recorded before arrival is applied");
+        assert_eq!(apply_marks_to_entries(&conn, None).unwrap(), 0, "applying again changes nothing");
+    }
+
+    #[test]
+    fn read_marks_are_recorded_only_inside_the_window() {
+        let conn = open_memory().unwrap();
+        let feed = insert_feed(&conn, "a");
+        let recent = stamp_days_ago(0);
+        let old = stamp_days_ago(30);
+        insert_entry(&conn, feed, "recent", "R", None, "<p>x</p>", Some(&recent)).unwrap();
+        insert_entry(&conn, feed, "old", "O", None, "<p>x</p>", Some(&old)).unwrap();
+
+        let recent_id = entry_id(&conn, "recent");
+        let old_id = entry_id(&conn, "old");
+        set_read(&conn, recent_id, true).unwrap();
+        set_read(&conn, old_id, true).unwrap();
+
+        assert!(rows_read(&conn, recent_id) && rows_read(&conn, old_id));
+        let shared: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT guid FROM sync_marks ORDER BY guid").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(shared, vec!["recent"], "an old read mark is local only");
+    }
+
+    #[test]
+    fn stars_are_recorded_regardless_of_the_window() {
+        let conn = open_memory().unwrap();
+        let feed = insert_feed(&conn, "a");
+        let old = stamp_days_ago(300);
+        insert_entry(&conn, feed, "old", "O", None, "<p>x</p>", Some(&old)).unwrap();
+        let id = entry_id(&conn, "old");
+
+        set_starred(&conn, id, true).unwrap();
+
+        let star: Option<i64> = conn
+            .query_row("SELECT star FROM sync_marks WHERE guid = 'old'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(star, Some(1), "stars never expire");
+    }
+
+    #[test]
+    fn the_ledger_is_seeded_once_from_an_existing_library() {
+        let conn = open_memory().unwrap();
+        let feed = insert_feed(&conn, "a");
+        let recent = stamp_days_ago(1);
+        let old = stamp_days_ago(300);
+        insert_entry(&conn, feed, "recent", "R", None, "<p>x</p>", Some(&recent)).unwrap();
+        insert_entry(&conn, feed, "old", "O", None, "<p>x</p>", Some(&old)).unwrap();
+        // Written directly, the way a build without a ledger would have.
+        conn.execute("UPDATE entries SET is_read = 1 WHERE guid = 'recent'", [])
+            .unwrap();
+        conn.execute("UPDATE entries SET is_starred = 1 WHERE guid = 'old'", [])
+            .unwrap();
+        conn.execute("DELETE FROM app_meta WHERE key = 'marks_seeded'", [])
+            .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let seeded: Vec<(String, i64, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT guid, read_ctr, star_ctr FROM sync_marks ORDER BY guid")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(seeded, vec![("old".into(), 0, 0), ("recent".into(), 0, 0)]);
+        assert!(
+            seeded.iter().all(|(_, read_ctr, star_ctr)| *read_ctr == 0 && *star_ctr == 0),
+            "seeded rows are the weakest possible, so any real edit outranks them"
+        );
+
+        init_schema(&conn).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_marks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 2, "seeding does not repeat");
+    }
+
+    #[test]
+    fn deleting_records_a_tombstone_and_still_cascades() {
+        let conn = open_memory().unwrap();
+        let feed = insert_feed(&conn, "a");
+        let published = stamp_days_ago(0);
+        insert_entry(&conn, feed, "g", "T", None, "<p>x</p>", Some(&published)).unwrap();
+        let folder = create_folder(&conn, "Tech").unwrap();
+        let (folder_uuid, _, _) = folder_fields(&conn, folder.id);
+
+        delete_feed(&conn, feed).unwrap();
+        delete_folder(&conn, folder.id).unwrap();
+
+        let entries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(entries, 0, "entries still cascade");
+        assert!(
+            tombstone_ctr(&conn, TOMBSTONE_FEED, "https://a.example/feed").unwrap() > 0,
+            "the removal is remembered"
+        );
+        assert!(tombstone_ctr(&conn, TOMBSTONE_FOLDER, &folder_uuid).unwrap() > 0);
+    }
+
+    #[test]
+    fn old_tombstones_are_pruned() {
+        let conn = open_memory().unwrap();
+        raise_tombstone(&conn, TOMBSTONE_FEED, "https://old.example/feed", 3, "2000-01-01")
+            .unwrap();
+        raise_tombstone(&conn, TOMBSTONE_FEED, "https://new.example/feed", 4, &days_ago(1))
+            .unwrap();
+
+        assert_eq!(prune_tombstones(&conn).unwrap(), 1);
+        assert_eq!(tombstones_all(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn adding_a_feed_again_outranks_its_own_tombstone() {
+        let conn = open_memory().unwrap();
+        let first = insert_feed(&conn, "a");
+        delete_feed(&conn, first).unwrap();
+        let url = "https://a.example/feed";
+        let removed_at = tombstone_ctr(&conn, TOMBSTONE_FEED, url).unwrap();
+
+        let again = insert_feed(&conn, "a");
+
+        assert!(
+            feed_sync_ctr(&conn, again) > removed_at,
+            "re-adding is a newer intent than the removal"
+        );
+        let listed = list_feeds(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
     }
 }

@@ -1,12 +1,25 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
-import { addFeed, createFolder, exportOpml, importOpml } from "../api";
+import {
+  addFeed,
+  createFolder,
+  exportOpml,
+  exportSyncDocument,
+  importOpml,
+  importSyncDocument,
+} from "../api";
+import type { SyncImportSummary } from "../api";
 import { blockKeyboard } from "../lib/keyboard-blocks";
 import {
   pickOpmlDestination,
   pickOpmlText,
   writeOpmlText,
 } from "../lib/opml-file";
+import {
+  pickSyncDestination,
+  pickSyncText,
+  writeSyncText,
+} from "../lib/sync-file";
 
 defineProps<{
   /** True while a background refresh runs; disables the actions below. */
@@ -107,6 +120,62 @@ async function doExport() {
   }
 }
 
+// --- Sync document import/export ---
+const syncError = ref<string | null>(null);
+
+/** One sentence on what an import changed, so the reader can see it did something. */
+function describe(summary: SyncImportSummary): string {
+  const parts: string[] = [];
+  if (summary.feeds_added) parts.push(`${summary.feeds_added} feed(s) added`);
+  if (summary.feeds_changed) parts.push(`${summary.feeds_changed} feed(s) updated`);
+  if (summary.feeds_removed) parts.push(`${summary.feeds_removed} feed(s) removed`);
+  if (summary.folders_added) parts.push(`${summary.folders_added} folder(s) added`);
+  if (summary.folders_changed) parts.push(`${summary.folders_changed} folder(s) renamed`);
+  if (summary.folders_removed) parts.push(`${summary.folders_removed} folder(s) removed`);
+  if (summary.stars_applied) parts.push(`${summary.stars_applied} star(s)`);
+  if (summary.read_marks_applied) {
+    parts.push(`${summary.read_marks_applied} read mark(s)`);
+  }
+  if (summary.marks_recorded_for_later) {
+    parts.push(
+      `${summary.marks_recorded_for_later} mark(s) waiting for their feed`,
+    );
+  }
+  return parts.length
+    ? `Sync import complete: ${parts.join(", ")}`
+    : "Sync import complete: nothing needed changing";
+}
+
+async function doSyncImport() {
+  syncError.value = null;
+  notice.value = null;
+  try {
+    const text = await pickSyncText();
+    if (text === null) return;
+    const summary = await importSyncDocument(text);
+    notice.value = describe(summary);
+    emit("changed");
+  } catch (e) {
+    syncError.value = String(e);
+  }
+}
+
+async function doSyncExport() {
+  syncError.value = null;
+  notice.value = null;
+  try {
+    const destination = await pickSyncDestination();
+    if (!destination) return;
+    const outcome = await exportSyncDocument();
+    await writeSyncText(destination, outcome.text);
+    notice.value =
+      `Exported ${outcome.feeds_exported} feeds, ` +
+      `${outcome.folders_exported} folder(s), ${outcome.marks_exported} mark(s)`;
+  } catch (e) {
+    syncError.value = String(e);
+  }
+}
+
 function onKey(event: KeyboardEvent) {
   if (event.key === "Escape") emit("close");
 }
@@ -183,6 +252,29 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <p v-if="opmlError" class="dialog-error">{{ opmlError }}</p>
+        </section>
+
+        <section class="section">
+          <h3 class="section-title">Sync</h3>
+          <div class="row sync">
+            <button
+              type="button"
+              :disabled="busy"
+              title="Merge a sync document exported from another device"
+              @click="doSyncImport"
+            >
+              Import Sync Document
+            </button>
+            <button
+              type="button"
+              :disabled="busy"
+              title="Write this library's shared state to a sync document"
+              @click="doSyncExport"
+            >
+              Export Sync Document
+            </button>
+          </div>
+          <p v-if="syncError" class="dialog-error">{{ syncError }}</p>
         </section>
 
         <div class="dialog-actions">

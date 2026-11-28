@@ -2,18 +2,18 @@
 
 ## Purpose
 
-Gathers infrequent subscription-management actions — adding a feed, creating a folder, OPML import/export — into a single Settings dialog opened from one sidebar entry, so the sidebar's first screen stays dedicated to navigation.
+Gathers infrequent subscription-management actions — adding a feed, creating a folder, OPML import/export, and sync-document import/export — into a single Settings dialog opened from one sidebar entry, so the sidebar's first screen stays dedicated to navigation.
 
 ## Requirements
 
 ### Requirement: Settings dialog hosts infrequent subscription-management actions
 
-The system SHALL provide a Settings dialog containing an add-feed-by-URL input, a create-folder action, and OPML import and export actions. Each action SHALL retain the behavior required by its own capability (adding a feed, creating a folder, OPML import/export), and every validation error and outcome message for these actions SHALL be visible while the Settings dialog is open.
+The system SHALL provide a Settings dialog containing an add-feed-by-URL input, a create-folder action, OPML import and export actions, and sync-document import and export actions. Each action SHALL retain the behavior required by its own capability (adding a feed, creating a folder, OPML import/export, sync-document import/export), and every validation error and outcome message for these actions SHALL be visible while the Settings dialog is open.
 
 #### Scenario: Opening settings reveals the management actions
 
 - **WHEN** the user opens the Settings dialog
-- **THEN** it shows a feed URL input, a folder-name input, and Import OPML / Export OPML controls
+- **THEN** it shows a feed URL input, a folder-name input, Import OPML / Export OPML controls, and Import Sync Document / Export Sync Document controls
 
 #### Scenario: Adding a feed from the Settings dialog
 
@@ -29,6 +29,21 @@ The system SHALL provide a Settings dialog containing an add-feed-by-URL input, 
 
 - **WHEN** the user creates a folder named "Tech" from the Settings dialog
 - **THEN** an empty folder named "Tech" appears in the sidebar and the dialog reports success
+
+#### Scenario: Sync-document import summary is reported in the Settings dialog
+
+- **WHEN** the user imports a sync document from the Settings dialog
+- **THEN** the applied-changes summary is shown in the dialog, and the imported feeds and folders appear in the sidebar
+
+#### Scenario: Sync-document export outcome is reported in the Settings dialog
+
+- **WHEN** the user exports a sync document from the Settings dialog and picks a destination
+- **THEN** the dialog reports that the document was written
+
+#### Scenario: A rejected sync document reports why
+
+- **WHEN** the user picks a sync document that this build cannot read
+- **THEN** the dialog shows the reason it was rejected and the sidebar is unchanged
 
 ### Requirement: Single settings entry point in the sidebar
 
