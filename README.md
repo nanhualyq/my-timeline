@@ -64,5 +64,39 @@ npm run android:build  # release APK under src-tauri/gen/android/app/build/outpu
 project under `src-tauri/gen/android` is committed, because it carries the
 manifest, the launcher icons, and `MainActivity`.
 
+### Release signing
+
+The release keystore is committed on purpose, so a fresh checkout produces a
+signed APK with no extra setup:
+
+- `src-tauri/gen/android/keystore/mytimeline-release.jks` — key alias
+  `mytimeline`, store and key password `Timeline@2025`
+- `src-tauri/gen/android/keystore.properties` — the values
+  `app/build.gradle.kts` reads
+
+```bash
+npm run android:build
+# -> src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+```
+
+`app/build.gradle.kts` binds the release signing config only when
+`keystore.properties` is present; without it the build still succeeds but
+leaves the APK unsigned. Check which key a build uses with:
+
+```bash
+cd src-tauri/gen/android && ./gradlew :app:signingReport -q | grep -A4 Release
+```
+
+Because the repository is public, this private key is public as well. Nothing
+about a store listing can be hijacked — the app is sideloaded — but anyone can
+sign an APK with the same application id, and it would install as an update
+over an existing installation and inherit its data, including the WebDAV
+credentials stored in it. Only install `com.mytimeline.app` builds that came
+from this repository.
+
+Replacing the key later does not break anything, but it cannot upgrade over the
+current installation: the old app has to be uninstalled first, which drops its
+local library unless it was exported.
+
 The Android commands require the Android toolchain. The desktop commands above
 do not, so a machine without the SDK can still build and test the desktop app.

@@ -14,7 +14,10 @@ build
 .cxx
 local.properties
 key.properties
-keystore.properties
+# The release keystore and its passwords are committed on purpose: this is a
+# personal app that is never published to a store, so every checkout can build
+# a signed APK without moving a secret around by hand. See README "Release
+# signing" for the password and for what a leaked key can be abused for.
 
 /.tauri
 /tauri.settings.gradle
