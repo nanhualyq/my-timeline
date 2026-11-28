@@ -16,6 +16,15 @@ npm test           # Vitest suite
 npm run build:app  # packaged Windows application
 ```
 
+### Verifying UI behavior
+
+Do not verify by screenshot — it only proves a window rendered. The Android build
+can be driven at the DOM level over the DevTools protocol (emulator + `adb` +
+`Runtime.evaluate` / `Input.dispatchTouchEvent`), which exercises real gestures;
+the desktop build is driven by hand through WebView2's DevTools. `AGENTS.md` has
+the exact commands, including why `--remote-debugging-port` does not work for the
+desktop webview.
+
 Desktop builds need only Node.js, npm, and a Rust toolchain.
 
 ## Android
