@@ -49,3 +49,11 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# A local stub server for the sync tests. `rustls` is only needed on the server
+# side of a self-signed handshake test; both crates are already in the tree.
+[dev-dependencies]
+# default-features off: the crate's default pulls in aws-lc-rs, which would
+# leave two crypto providers compiled and make the choice ambiguous at runtime.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+base64 = "0.22"

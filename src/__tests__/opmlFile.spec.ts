@@ -140,7 +140,9 @@ describe("settings dialog OPML actions", () => {
     await wrapper.get(".row.opml button").trigger("click");
     await flush();
 
-    expect(harness.invoke).not.toHaveBeenCalled();
+    // The dialog reads the saved WebDAV connection when it opens; what must not
+    // happen is an import.
+    expect(harness.invoke).not.toHaveBeenCalledWith("import_opml", expect.anything());
     expect(wrapper.find(".dialog-notice").exists()).toBe(false);
   });
 
@@ -171,7 +173,7 @@ describe("settings dialog OPML actions", () => {
     await buttons[1].trigger("click");
     await flush();
 
-    expect(harness.invoke).not.toHaveBeenCalled();
+    expect(harness.invoke).not.toHaveBeenCalledWith("export_opml", expect.anything());
     expect(harness.writeTextFile).not.toHaveBeenCalled();
   });
 
@@ -184,7 +186,7 @@ describe("settings dialog OPML actions", () => {
     await flush();
 
     expect(wrapper.get(".dialog-error").text()).toContain("cannot read");
-    expect(harness.invoke).not.toHaveBeenCalled();
+    expect(harness.invoke).not.toHaveBeenCalledWith("import_opml", expect.anything());
   });
 });
 

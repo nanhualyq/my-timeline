@@ -4,6 +4,7 @@ mod opml;
 mod reader;
 mod rowdetail;
 mod sync;
+mod webdav;
 
 use reader::{AddFeedResult, SharedConn};
 use std::sync::{Arc, Mutex};
@@ -261,6 +262,68 @@ async fn refresh_all(app: tauri::AppHandle) -> Result<Vec<reader::RefreshOutcome
         .collect())
 }
 
+/// The saved WebDAV connection, or `None` when the form has never been filled
+/// in. Separate from the sync commands so the dialog can render the fields
+/// without touching the network.
+#[tauri::command]
+fn load_sync_config(app: tauri::AppHandle) -> Result<Option<db::SyncConfig>, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::load_sync_config(&guard).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_sync_config(app: tauri::AppHandle, config: db::SyncConfig) -> Result<(), String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    db::save_sync_config(&guard, &config).map_err(|e| e.to_string())
+}
+
+/// Check the saved connection without changing anything, so a wrong URL, path,
+/// or password is reported at configuration time rather than at the next sync.
+#[tauri::command]
+async fn test_sync_connection(app: tauri::AppHandle) -> Result<webdav::ConnectionTest, String> {
+    let config = {
+        let conn = shared_conn(&app)?;
+        let guard = conn.lock().map_err(|e| e.to_string())?;
+        db::load_sync_config(&guard).map_err(|e| e.to_string())?
+    };
+    let Some(config) = config.filter(db::SyncConfig::is_configured) else {
+        return Err("the WebDAV connection is not configured".into());
+    };
+    let target = webdav::Target::from_config(&config)?;
+    webdav::test_connection(&target).await
+}
+
+/// Run one sync cycle. `force` bypasses the focus throttle; the "only one at a
+/// time" rule is never bypassed.
+///
+/// A sync that fails to reach the server returns a `Failed` status rather than
+/// an error: the reader is shown a status either way, and the status is what
+/// gets recorded for later. An error means nothing was attempted at all.
+#[tauri::command]
+async fn sync_now(app: tauri::AppHandle, force: bool) -> Result<sync::SyncStatus, String> {
+    let engine = app
+        .state::<std::sync::Arc<sync::SyncEngine>>()
+        .inner()
+        .clone();
+    let conn = shared_conn(&app)?;
+    engine.sync(&conn, force).await
+}
+
+/// The last sync's outcome, for a dialog opened after a sync that ran on focus
+/// or at startup.
+#[tauri::command]
+fn sync_status(app: tauri::AppHandle) -> Result<Option<sync::SyncStatus>, String> {
+    let conn = shared_conn(&app)?;
+    let guard = conn.lock().map_err(|e| e.to_string())?;
+    let config = db::load_sync_config(&guard).map_err(|e| e.to_string())?;
+    match config {
+        Some(config) => sync::last_status(&guard, &config),
+        None => Ok(None),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -290,6 +353,8 @@ pub fn run() {
             };
             let conn = db::open(&data_dir.join("reader.db")).map_err(|e| e.to_string())?;
             app.manage(Arc::new(Mutex::new(conn)) as SharedConn);
+            // One sync at a time, decided here rather than by the triggers.
+            app.manage(Arc::new(sync::SyncEngine::new()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -312,6 +377,11 @@ pub fn run() {
             export_opml,
             export_sync_document,
             import_sync_document,
+            load_sync_config,
+            save_sync_config,
+            test_sync_connection,
+            sync_now,
+            sync_status,
             remove_feed,
             add_feed,
             refresh_feed,
@@ -367,5 +437,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("version 99"), "{error}");
+    }
+
+    /// Registration is the one thing `cargo check` cannot catch: a command that
+    /// exists but is missing from the handler simply never runs from the UI.
+    #[test]
+    fn every_sync_command_is_registered_with_the_handler() {
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split("generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("a handler list");
+        for command in [
+            "load_sync_config",
+            "save_sync_config",
+            "test_sync_connection",
+            "sync_now",
+            "sync_status",
+            "export_sync_document",
+            "import_sync_document",
+        ] {
+            assert!(handler.contains(command), "{command} is not registered");
+        }
     }
 }

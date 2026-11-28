@@ -2576,12 +2576,14 @@ name = "my-timeline"
 version = "0.1.0"
 dependencies = [
  "ammonia",
+ "base64 0.22.1",
  "chrono",
  "feed-rs",
  "futures",
  "reqwest 0.12.28",
  "roxmltree",
  "rusqlite",
+ "rustls",
  "scraper",
  "serde",
  "serde_json",

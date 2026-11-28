@@ -189,7 +189,12 @@ describe("settings dialog sync actions", () => {
     await wrapper.get(".row.sync button").trigger("click");
     await flush();
 
-    expect(harness.invoke).not.toHaveBeenCalled();
+    // The dialog reads the saved WebDAV connection when it opens; what must not
+    // happen is an import.
+    expect(harness.invoke).not.toHaveBeenCalledWith(
+      "import_sync_document",
+      expect.anything(),
+    );
     expect(wrapper.find(".dialog-notice").exists()).toBe(false);
     expect(wrapper.find(".dialog-error").exists()).toBe(false);
   });
@@ -243,7 +248,10 @@ describe("settings dialog sync actions", () => {
     await buttons[1].trigger("click");
     await flush();
 
-    expect(harness.invoke).not.toHaveBeenCalled();
+    expect(harness.invoke).not.toHaveBeenCalledWith(
+      "export_sync_document",
+      expect.anything(),
+    );
     expect(harness.writeTextFile).not.toHaveBeenCalled();
   });
 });

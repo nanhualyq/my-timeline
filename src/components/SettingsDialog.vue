@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   addFeed,
   createFolder,
@@ -7,8 +7,17 @@ import {
   exportSyncDocument,
   importOpml,
   importSyncDocument,
+  loadSyncConfig,
+  saveSyncConfig,
+  syncNow,
+  syncStatus,
+  testSyncConnection,
 } from "../api";
-import type { SyncImportSummary } from "../api";
+import type {
+  SyncConfig,
+  SyncImportSummary,
+  SyncStatus,
+} from "../api";
 import { blockKeyboard } from "../lib/keyboard-blocks";
 import {
   pickOpmlDestination,
@@ -176,6 +185,94 @@ async function doSyncExport() {
   }
 }
 
+// --- WebDAV connection ------------------------------------------------
+const config = ref<SyncConfig>({
+  url: "",
+  path: "",
+  username: "",
+  password: "",
+  accept_invalid_certs: false,
+});
+const syncBusy = ref(false);
+const syncConfigError = ref<string | null>(null);
+const syncing = ref(false);
+const lastStatus = ref<SyncStatus | null>(null);
+
+/** The status line: when the last sync ran, what it did, and why it failed. */
+const statusLine = computed(() => {
+  const status = lastStatus.value;
+  if (status === null) return null;
+  const when = new Date(status.ran_at).toLocaleString();
+  const prefix =
+    status.outcome === "failed" ? `Last sync ${when} failed` : `Last sync ${when}`;
+  return `${prefix}: ${status.detail}`;
+});
+
+const configured = computed(() => config.value.url.trim() !== "");
+
+async function loadSync() {
+  try {
+    const saved = await loadSyncConfig();
+    if (saved) config.value = saved;
+    lastStatus.value = await syncStatus();
+  } catch (e) {
+    syncConfigError.value = String(e);
+  }
+}
+
+async function saveSync() {
+  if (syncBusy.value || !configured.value) return;
+  syncBusy.value = true;
+  syncConfigError.value = null;
+  notice.value = null;
+  try {
+    await saveSyncConfig({ ...config.value });
+    notice.value = "Sync connection saved";
+  } catch (e) {
+    syncConfigError.value = String(e);
+  } finally {
+    syncBusy.value = false;
+  }
+}
+
+async function testConnection() {
+  if (syncBusy.value || !configured.value) return;
+  syncBusy.value = true;
+  syncConfigError.value = null;
+  notice.value = null;
+  try {
+    // Save first: the backend tests the saved connection, so an unsaved edit
+    // would be tested against the wrong settings.
+    await saveSyncConfig({ ...config.value });
+    const result = await testSyncConnection();
+    notice.value = result.document_exists
+      ? "Connection works; the document exists"
+      : "Connection works; the document will be created on the first sync";
+  } catch (e) {
+    syncConfigError.value = String(e);
+  } finally {
+    syncBusy.value = false;
+  }
+}
+
+async function runSync() {
+  if (syncing.value || !configured.value) return;
+  syncing.value = true;
+  syncConfigError.value = null;
+  notice.value = null;
+  try {
+    await saveSyncConfig({ ...config.value });
+    lastStatus.value = await syncNow(true);
+    if (lastStatus.value.outcome === "synced" || lastStatus.value.outcome === "created") {
+      emit("changed");
+    }
+  } catch (e) {
+    syncConfigError.value = String(e);
+  } finally {
+    syncing.value = false;
+  }
+}
+
 function onKey(event: KeyboardEvent) {
   if (event.key === "Escape") emit("close");
 }
@@ -184,7 +281,10 @@ function onKey(event: KeyboardEvent) {
 // the fields inside it.
 const releaseKeyboard = blockKeyboard();
 
-onMounted(() => document.addEventListener("keydown", onKey));
+onMounted(() => {
+  document.addEventListener("keydown", onKey);
+  void loadSync();
+});
 onBeforeUnmount(() => {
   document.removeEventListener("keydown", onKey);
   releaseKeyboard();
@@ -277,6 +377,67 @@ onBeforeUnmount(() => {
           <p v-if="syncError" class="dialog-error">{{ syncError }}</p>
         </section>
 
+        <section class="section">
+          <h3 class="section-title">WebDAV sync</h3>
+          <form class="sync-connection" @submit.prevent="saveSync">
+            <input
+              v-model="config.url"
+              type="url"
+              placeholder="Server URL — https://dav.example/dav"
+              :disabled="busy || syncBusy || syncing"
+            />
+            <input
+              v-model="config.path"
+              type="text"
+              placeholder="Remote path — my-timeline-sync.json"
+              :disabled="busy || syncBusy || syncing"
+            />
+            <input
+              v-model="config.username"
+              type="text"
+              placeholder="Username"
+              :disabled="busy || syncBusy || syncing"
+            />
+            <input
+              v-model="config.password"
+              type="password"
+              placeholder="Password"
+              :disabled="busy || syncBusy || syncing"
+            />
+            <label class="checkbox">
+              <input
+                v-model="config.accept_invalid_certs"
+                type="checkbox"
+                :disabled="busy || syncBusy || syncing"
+              />
+              Accept an invalid certificate (self-signed server)
+            </label>
+            <div class="row sync-actions">
+              <button type="submit" :disabled="busy || syncBusy || syncing || !configured">
+                Save
+              </button>
+              <button
+                type="button"
+                :disabled="busy || syncBusy || syncing || !configured"
+                title="Check the server, the credentials, and whether the document exists"
+                @click="testConnection"
+              >
+                Test
+              </button>
+              <button
+                type="button"
+                :disabled="busy || syncBusy || syncing || !configured"
+                title="Sync now, ignoring the focus throttle"
+                @click="runSync"
+              >
+                {{ syncing ? "Syncing…" : "Sync now" }}
+              </button>
+            </div>
+          </form>
+          <p v-if="statusLine" class="dialog-status">{{ statusLine }}</p>
+          <p v-if="syncConfigError" class="dialog-error">{{ syncConfigError }}</p>
+        </section>
+
         <div class="dialog-actions">
           <button type="button" class="secondary" @click="emit('close')">
             Close
@@ -358,6 +519,32 @@ onBeforeUnmount(() => {
 .row button:disabled {
   opacity: 0.6;
   cursor: default;
+}
+.sync-connection {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.sync-connection input:not([type="checkbox"]) {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+.sync-connection .checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: #444;
+}
+.row.sync-actions button {
+  flex: 1;
+}
+.dialog-status {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #444;
 }
 .dialog-notice {
   margin: 0;

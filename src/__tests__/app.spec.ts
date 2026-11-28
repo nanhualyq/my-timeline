@@ -37,9 +37,29 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: async () => undefined }))
 let backend: FakeBackend;
 
 async function mountApp(
-  options: { entries?: number; feeds?: number; view?: "all" | "unread" } = {},
+  options: {
+    entries?: number;
+    feeds?: number;
+    view?: "all" | "unread";
+    /** A saved WebDAV connection, as the settings dialog would have left it. */
+    sync?: { url?: string; outcome?: "synced" | "created" | "nothing_changed" | "failed" };
+  } = {},
 ): Promise<VueWrapper> {
   backend = new FakeBackend(options);
+  if (options.sync) {
+    backend.syncConfig = {
+      url: options.sync.url ?? "https://dav.example/dav",
+      path: "",
+      username: "me",
+      password: "secret",
+      accept_invalid_certs: false,
+    };
+    backend.syncOutcome = {
+      ran_at: new Date(0).toISOString(),
+      outcome: options.sync.outcome ?? "nothing_changed",
+      detail: "1 feed(s) added",
+    };
+  }
   harness.backend = backend;
   const wrapper = mount(App);
   await flush();
@@ -626,5 +646,46 @@ describe("list filter", () => {
     expect(list(wrapper).props("unreadFilterAvailable")).toBe(false);
     expect(wrapper.findAll(".view-tabs button"), "no unread tab").toHaveLength(1);
     expect(rows(wrapper).some((r) => r.is_read)).toBe(true);
+  });
+});
+
+describe("background sync", () => {
+  it("sends no sync command when no connection is configured", async () => {
+    await mountApp({ entries: 5 });
+
+    expect(backend.countCalls("load_sync_config")).toBe(1);
+    expect(backend.countCalls("sync_now")).toBe(0);
+  });
+
+  it("refreshes the view after a sync that applied changes", async () => {
+    // Baseline: the same library with no connection, loaded once.
+    await mountApp({ entries: 5 });
+    const withoutSync = backend.countCalls("list_entries");
+
+    await mountApp({ entries: 5, sync: { outcome: "synced" } });
+
+    expect(backend.countCalls("sync_now")).toBe(1);
+    expect(backend.countCalls("list_entries")).toBeGreaterThan(withoutSync);
+  });
+
+  it("leaves the view alone after a sync that changed nothing", async () => {
+    await mountApp({ entries: 5, sync: { outcome: "nothing_changed" } });
+    await flush();
+    const lists = backend.countCalls("list_entries");
+
+    expect(backend.countCalls("sync_now")).toBe(1);
+    expect(backend.countCalls("list_entries")).toBe(lists);
+  });
+
+  it("syncs again when the window regains focus", async () => {
+    await mountApp({ entries: 5, sync: { outcome: "nothing_changed" } });
+    const before = backend.countCalls("sync_now");
+
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+
+    // Apps mounted by earlier tests are still listening on the same window, so
+    // what matters is that focus causes another sync, not the exact count.
+    expect(backend.countCalls("sync_now")).toBeGreaterThan(before);
   });
 });

@@ -43,6 +43,7 @@ import {
 } from "./api";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { message } from "@tauri-apps/plugin-dialog";
+import { runBackgroundSync } from "./lib/background-sync";
 import { useLayout, useMediaQuery, HOVER_MEDIA_QUERY } from "./lib/viewport";
 import { createBackStack, type BackStack } from "./lib/back-stack";
 
@@ -962,12 +963,34 @@ function onVisibilityChange() {
   void resumeRefresh();
 }
 
+/** Sync in the background, then refresh the view if the library changed.
+ *  Never surfaces an error: an unconfigured connection and a failed sync are
+ *  both reported in Settings, which is where the connection is configured. */
+async function syncQuietly(): Promise<void> {
+  await runBackgroundSync(reload);
+}
+
+/** The window regained focus: a moment worth checking the server. Throttled in
+ *  the backend, so extra events cost one channel message. */
+function onWindowFocus() {
+  void syncQuietly();
+}
+
+/** Coming back to a visible tab is the mobile equivalent of focus. */
+function onVisibleForSync() {
+  if (document.visibilityState === "visible") void syncQuietly();
+}
+
 onMounted(() => {
   backStack = createBackStack({ onBack: closeTopLayer });
   backStack.sync(openLayers.value.length);
-  void reload();
+  // Startup sync runs after the first load, so its effects are what the reader
+  // sees rather than something the load then overwrites.
+  void reload().then(syncQuietly);
   document.addEventListener("keydown", onKeydown);
+  window.addEventListener("focus", onWindowFocus);
   document.addEventListener("visibilitychange", onVisibilityChange);
+  document.addEventListener("visibilitychange", onVisibleForSync);
   window.addEventListener("blur", flushOnLeave);
   window.addEventListener("beforeunload", flushOnLeave);
 });
@@ -977,6 +1000,8 @@ onBeforeUnmount(() => {
   backStack = null;
   document.removeEventListener("keydown", onKeydown);
   document.removeEventListener("visibilitychange", onVisibilityChange);
+  document.removeEventListener("visibilitychange", onVisibleForSync);
+  window.removeEventListener("focus", onWindowFocus);
   window.removeEventListener("blur", flushOnLeave);
   window.removeEventListener("beforeunload", flushOnLeave);
   clearPrefixTimer();

@@ -1,5 +1,13 @@
 import { vi } from "vitest";
-import type { Cursor, EntryScope, EntryView, Feed, Folder } from "../api";
+import type {
+  Cursor,
+  EntryScope,
+  EntryView,
+  Feed,
+  Folder,
+  SyncConfig,
+  SyncStatus,
+} from "../api";
 
 /** A stored entry as the backend sees it: rows carry their ordering position,
  *  full entries carry their body. */
@@ -38,6 +46,16 @@ export class FakeBackend {
   readonly feeds: Feed[] = [];
   readonly folders: Folder[] = [];
   readonly calls: { cmd: string; args: Args }[] = [];
+
+  /** The saved WebDAV connection; null means it was never configured. */
+  syncConfig: SyncConfig | null = null;
+
+  /** What the next sync reports. */
+  syncOutcome: SyncStatus = {
+    ran_at: new Date(0).toISOString(),
+    outcome: "nothing_changed",
+    detail: "no changes on either side",
+  };
 
   private gates: { cmd: string; promise: Promise<void> }[] = [];
 
@@ -164,6 +182,12 @@ export class FakeBackend {
       }
       case "refresh_all":
         return [];
+      case "load_sync_config":
+        return this.syncConfig;
+      case "sync_now":
+        return this.syncOutcome;
+      case "sync_status":
+        return this.syncConfig ? this.syncOutcome : null;
       case "remove_feed": {
         const feedId = args.feedId as number;
         const keep = this.entries.filter((e) => e.feed_id !== feedId);

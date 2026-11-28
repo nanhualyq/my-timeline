@@ -307,3 +307,55 @@ export function exportSyncDocument(): Promise<SyncExportOutcome> {
 export function importSyncDocument(text: string): Promise<SyncImportSummary> {
   return invoke("import_sync_document", { text });
 }
+
+// --- WebDAV sync ---------------------------------------------------------
+
+/** Where the sync document lives, plus the credential decision for it. The
+ *  password is stored in the same local database as everything else. */
+export interface SyncConfig {
+  url: string;
+  path: string;
+  username: string;
+  password: string;
+  accept_invalid_certs: boolean;
+}
+
+export type SyncOutcome = "synced" | "created" | "nothing_changed" | "failed";
+
+export interface SyncStatus {
+  /** RFC3339, so the dialog can say when rather than only what. */
+  ran_at: string;
+  outcome: SyncOutcome;
+  /** What was applied, or why the cycle failed — already a sentence. */
+  detail: string;
+}
+
+export interface SyncConnectionTest {
+  document_exists: boolean;
+  document_url: string;
+}
+
+/** The saved connection, or null when the form has never been filled in. */
+export function loadSyncConfig(): Promise<SyncConfig | null> {
+  return invoke<SyncConfig | null>("load_sync_config");
+}
+
+export function saveSyncConfig(config: SyncConfig): Promise<void> {
+  return invoke("save_sync_config", { config });
+}
+
+/** Check the saved connection without syncing or changing anything. */
+export function testSyncConnection(): Promise<SyncConnectionTest> {
+  return invoke<SyncConnectionTest>("test_sync_connection");
+}
+
+/** Run one sync cycle. `force` bypasses the focus throttle, never the
+ *  "one sync at a time" rule. Rejects only when nothing was attempted. */
+export function syncNow(force: boolean): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_now", { force });
+}
+
+/** The last sync's outcome, for a dialog opened after a background sync. */
+export function syncStatus(): Promise<SyncStatus | null> {
+  return invoke<SyncStatus | null>("sync_status");
+}

@@ -109,6 +109,21 @@ CREATE TABLE IF NOT EXISTS sync_tombstones (
     day TEXT NOT NULL,
     PRIMARY KEY (kind, key)
 );
+
+-- Where the document is kept. One row on purpose: whether it is configured is then a
+-- single fact with no ordering question, and a reader either has a connection
+-- or does not. The password is stored as it is used: this database already
+-- holds the full reading history in plain text, and a keychain would add a
+-- platform-specific dependency to protect one secret sitting beside far more
+-- of them.
+CREATE TABLE IF NOT EXISTS sync_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    url TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    password TEXT NOT NULL DEFAULT '',
+    accept_invalid_certs INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// How long a read mark stays shareable. Stars are exempt.
@@ -373,8 +388,11 @@ pub fn write_mark_star(
 
 pub fn marks_all(conn: &Connection) -> Result<Vec<MarkRow>, rusqlite::Error> {
     let mut stmt = conn.prepare(
+        // Ordered by the copyable identity, which is also the order `merge`
+        // produces: the two renderings of one state must be byte-identical, so
+        // that "is anything different" can be answered by comparing text.
         "SELECT feed_url, guid, day, read, read_ctr, star, star_ctr
-         FROM sync_marks ORDER BY day, feed_url, guid",
+         FROM sync_marks ORDER BY feed_url, guid",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(MarkRow {
@@ -613,6 +631,141 @@ pub fn tombstone_ctr(
         )
         .optional()?
         .unwrap_or(0))
+}
+
+// --- The remote connection ----------------------------------------------
+
+/// Where the document is kept. `accept_invalid_certs` exists for the self-signed
+/// servers a home WebDAV setup usually presents; it applies only to the sync
+/// client, never to feed fetching.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncConfig {
+    pub url: String,
+    pub path: String,
+    pub username: String,
+    pub password: String,
+    pub accept_invalid_certs: bool,
+}
+
+impl SyncConfig {
+    /// A server URL is the one thing that cannot be guessed or defaulted.
+    pub fn is_configured(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+}
+
+pub fn load_sync_config(conn: &Connection) -> Result<Option<SyncConfig>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT url, path, username, password, accept_invalid_certs
+         FROM sync_config WHERE id = 1",
+        [],
+        |r| {
+            Ok(SyncConfig {
+                url: r.get(0)?,
+                path: r.get(1)?,
+                username: r.get(2)?,
+                password: r.get(3)?,
+                accept_invalid_certs: r.get::<_, i64>(4)? != 0,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn save_sync_config(conn: &Connection, config: &SyncConfig) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO sync_config (id, url, path, username, password, accept_invalid_certs)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+             url = excluded.url,
+             path = excluded.path,
+             username = excluded.username,
+             password = excluded.password,
+             accept_invalid_certs = excluded.accept_invalid_certs",
+        params![
+            config.url.trim(),
+            config.path.trim(),
+            config.username.trim(),
+            config.password,
+            config.accept_invalid_certs as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// Per-remote records are keyed by the resolved document URL, not by "the
+/// connection": a reader who points the settings at a different document must
+/// not inherit the previous one's version, or the first sync against the new
+/// document would be skipped as "nothing changed".
+fn remote_key(kind: &str, document_url: &str) -> String {
+    format!("sync.{kind}.{document_url}")
+}
+
+fn remote_get(conn: &Connection, kind: &str, document_url: &str) -> Result<Option<String>, rusqlite::Error> {
+    meta_get(conn, &remote_key(kind, document_url))
+}
+
+fn remote_set(
+    conn: &Connection,
+    kind: &str,
+    document_url: &str,
+    value: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    let key = remote_key(kind, document_url);
+    match value {
+        Some(v) => meta_set(conn, &key, v),
+        None => {
+            conn.execute("DELETE FROM app_meta WHERE key = ?1", params![key])?;
+            Ok(())
+        }
+    }
+}
+
+/// The version tag the remote document had when it was last read.
+pub fn remote_etag(conn: &Connection, document_url: &str) -> Result<Option<String>, rusqlite::Error> {
+    remote_get(conn, "etag", document_url)
+}
+
+pub fn set_remote_etag(
+    conn: &Connection,
+    document_url: &str,
+    etag: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    remote_set(conn, "etag", document_url, etag)
+}
+
+/// The canonical text last written to the remote document, so an unchanged
+/// library produces no upload at all.
+pub fn remote_uploaded_text(
+    conn: &Connection,
+    document_url: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    remote_get(conn, "uploaded", document_url)
+}
+
+pub fn set_remote_uploaded_text(
+    conn: &Connection,
+    document_url: &str,
+    text: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    remote_set(conn, "uploaded", document_url, text)
+}
+
+/// The last sync status, kept as opaque text so the storage layer does not have
+/// to know what a sync is.
+pub fn remote_status_json(
+    conn: &Connection,
+    document_url: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    remote_get(conn, "status", document_url)
+}
+
+pub fn set_remote_status_json(
+    conn: &Connection,
+    document_url: &str,
+    json: &str,
+) -> Result<(), rusqlite::Error> {
+    remote_set(conn, "status", document_url, Some(json))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2759,4 +2912,106 @@ mod tests {
         let listed = list_feeds(&conn).unwrap();
         assert_eq!(listed.len(), 1);
     }
+    // --- The remote connection -------------------------------------------
+
+    #[test]
+    fn sync_config_holds_exactly_one_connection() {
+        let conn = open_memory().unwrap();
+        assert!(load_sync_config(&conn).unwrap().is_none(), "nothing configured yet");
+
+        let config = SyncConfig {
+            url: "https://dav.example/dav".into(),
+            path: "state.json".into(),
+            username: "me".into(),
+            password: "secret".into(),
+            accept_invalid_certs: true,
+        };
+        save_sync_config(&conn, &config).unwrap();
+
+        let loaded = load_sync_config(&conn).unwrap().unwrap();
+        assert_eq!(loaded.url, "https://dav.example/dav");
+        assert_eq!(loaded.path, "state.json");
+        assert_eq!(loaded.username, "me");
+        assert_eq!(loaded.password, "secret");
+        assert!(loaded.accept_invalid_certs);
+        assert!(loaded.is_configured());
+
+        // A second row is refused by the schema itself: "configured" stays a
+        // single fact rather than a question about ordering.
+        let error = conn
+            .execute("INSERT INTO sync_config (id, url) VALUES (2, 'https://x')", [])
+            .unwrap_err();
+        assert!(error.to_string().contains("CHECK"), "{error}");
+
+        // Saving again updates in place.
+        save_sync_config(
+            &conn,
+            &SyncConfig {
+                url: "https://other.example/dav".into(),
+                accept_invalid_certs: false,
+                ..config
+            },
+        )
+        .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_config", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        let loaded = load_sync_config(&conn).unwrap().unwrap();
+        assert_eq!(loaded.url, "https://other.example/dav");
+        assert!(!loaded.accept_invalid_certs);
+    }
+
+    #[test]
+    fn an_older_database_gains_the_connection_table_without_a_connection() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE folders (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+            .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        assert!(table_exists(&conn, "sync_config"));
+        assert!(load_sync_config(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_empty_server_url_is_not_a_configured_connection() {
+        let conn = open_memory().unwrap();
+        save_sync_config(&conn, &SyncConfig::default()).unwrap();
+        let loaded = load_sync_config(&conn).unwrap().unwrap();
+        assert!(!loaded.is_configured(), "the form is saved but unusable");
+    }
+
+    #[test]
+    fn remote_records_belong_to_one_document_url() {
+        let conn = open_memory().unwrap();
+        let a = "https://dav.example/dav/a.json";
+        let b = "https://dav.example/dav/b.json";
+
+        set_remote_etag(&conn, a, Some("\"3\"")).unwrap();
+        set_remote_uploaded_text(&conn, a, Some("{\"doc_version\":1}")).unwrap();
+        set_remote_status_json(&conn, a, "{\"outcome\":\"synced\"}").unwrap();
+
+        assert_eq!(remote_etag(&conn, a).unwrap().as_deref(), Some("\"3\""));
+        assert_eq!(
+            remote_uploaded_text(&conn, a).unwrap().as_deref(),
+            Some("{\"doc_version\":1}")
+        );
+        assert_eq!(
+            remote_status_json(&conn, a).unwrap().as_deref(),
+            Some("{\"outcome\":\"synced\"}")
+        );
+
+        // Pointing the settings at another document must not inherit anything:
+        // otherwise the first sync there would be skipped as "nothing changed".
+        assert!(remote_etag(&conn, b).unwrap().is_none());
+        assert!(remote_uploaded_text(&conn, b).unwrap().is_none());
+        assert!(remote_status_json(&conn, b).unwrap().is_none());
+
+        // Clearing one record leaves the others.
+        set_remote_etag(&conn, a, None).unwrap();
+        assert!(remote_etag(&conn, a).unwrap().is_none());
+        assert!(remote_uploaded_text(&conn, a).unwrap().is_some());
+    }
+
 }
