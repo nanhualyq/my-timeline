@@ -1,17 +1,10 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { blockKeyboard } from "../lib/keyboard-blocks";
-
-/** A single dropdown menu entry. */
-interface RowMenuItem {
-  key: string;
-  label: string;
-  /** Render in the destructive style (e.g. Delete, Remove). */
-  danger?: boolean;
-}
+import type { MenuItem } from "../lib/menu";
 
 const props = defineProps<{
-  items: RowMenuItem[];
+  items: MenuItem[];
   /** Accessible title for the ⋮ trigger button. */
   triggerTitle: string;
   disabled?: boolean;

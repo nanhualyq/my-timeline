@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
 import type { Entry, Feed } from "../api";
+import { useHorizontalDrag } from "../lib/gestures";
 
 const props = defineProps<{
   entry: Entry | null;
@@ -8,13 +9,25 @@ const props = defineProps<{
   /** True on the one-pane layout, where this component is a whole screen and
    *  therefore needs its own way back to the list. */
   narrow?: boolean;
+  /** True where the primary pointer is a finger: horizontal swipes switch
+   *  entries and the controls are sized to be tapped. */
+  touch?: boolean;
+  /** Whether a previous / next entry exists, so the screen can say so: a swipe
+   *  is not something a reader can discover from an absence. */
+  hasPrevious?: boolean;
+  hasNext?: boolean;
 }>();
 
 const emit = defineEmits<{
   toggleRead: [];
+  /** The open entry's star, so starring does not require leaving the article. */
+  toggleStar: [];
   openLink: [url: string];
   /** Narrow layout only: return to the entry list. */
   close: [];
+  /** Previous or next entry, on a touch layout: a swipe to either side. */
+  previous: [];
+  next: [];
 }>();
 
 const contentEl = ref<HTMLElement | null>(null);
@@ -26,6 +39,24 @@ function scrollByScreens(screens: number) {
   if (!el) return;
   el.scrollTop += screens * el.clientHeight;
 }
+
+/**
+ * Swiping the article switches entries: leftward is the next one, rightward the
+ * previous one, matching the direction the pages would turn.
+ *
+ * The gutter is doubled here rather than left at the row default, because the
+ * article sits against the screen edge with no row-level scroll competing for
+ * the same finger, so a drag is more likely to begin right at the edge where
+ * the system back gesture lives.
+ */
+const { onPointerDown: startDrag } = useHorizontalDrag({
+  enabled: () => props.touch === true,
+  gutter: 2 * 32,
+  onCommit: (_target, direction) => {
+    if (direction === "left") emit("next");
+    else emit("previous");
+  },
+});
 
 // A new entry starts at its beginning. Post-render, so the measurement is of
 // the content that just landed.
@@ -53,6 +84,29 @@ defineExpose({ scrollByScreens });
         >
           <span aria-hidden="true">&#8592;</span>
         </button>
+        <!-- The visible form of what the swipe does, disabled at each end.
+             The reading screen is the only place a touch reader can learn the
+             swipe exists. -->
+        <div v-if="props.touch" class="pane-steps">
+          <button
+            type="button"
+            class="btn step touch-target"
+            aria-label="Previous entry"
+            :disabled="!props.hasPrevious"
+            @click="emit('previous')"
+          >
+            &#8249;
+          </button>
+          <button
+            type="button"
+            class="btn step touch-target"
+            aria-label="Next entry"
+            :disabled="!props.hasNext"
+            @click="emit('next')"
+          >
+            &#8250;
+          </button>
+        </div>
         <div class="pane-meta">
           <h2 class="pane-title">{{ entry.title }}</h2>
           <p class="pane-sub">
@@ -63,6 +117,19 @@ defineExpose({ scrollByScreens });
           </p>
         </div>
         <div class="pane-actions">
+          <!-- On every layout: the pane is where an article is actually read,
+               so its star should not require going back to the list. -->
+          <button
+            type="button"
+            class="btn star-toggle"
+            :class="{ starred: entry.is_starred, 'touch-target': props.touch }"
+            :aria-label="entry.is_starred ? 'Unstar entry' : 'Star entry'"
+            :title="entry.is_starred ? 'Unstar' : 'Star'"
+            :aria-pressed="entry.is_starred"
+            @click="emit('toggleStar')"
+          >
+            {{ entry.is_starred ? "★" : "☆" }}
+          </button>
           <a
             v-if="entry.link"
             class="btn"
@@ -83,7 +150,12 @@ defineExpose({ scrollByScreens });
         </div>
       </header>
       <!-- content_html is sanitized with ammonia in the Rust backend before storage -->
-      <article ref="contentEl" class="content" v-html="entry.content_html"></article>
+      <article
+        ref="contentEl"
+        class="content"
+        v-html="entry.content_html"
+        @pointerdown="startDrag($event, { key: 'article' })"
+      ></article>
     </template>
     <p v-else class="placeholder">Select an entry to read.</p>
   </section>
@@ -143,6 +215,14 @@ defineExpose({ scrollByScreens });
   color: inherit;
   text-decoration: none;
 }
+.star-toggle {
+  font-size: 1rem;
+  line-height: 1;
+  min-width: 2.25rem;
+}
+.star-toggle.starred {
+  color: #d4a017;
+}
 .back {
   /* A screen-level control on the narrow layout: it has to be tappable. */
   font-size: 1rem;
@@ -159,6 +239,9 @@ defineExpose({ scrollByScreens });
   line-height: 1.6;
   flex: 1;
   min-height: 0;
+  /* Vertical scrolling stays native; the horizontal axis belongs to the entry
+     swipe. Text selection is unaffected by `touch-action`. */
+  touch-action: pan-y;
 }
 .content :deep(img) {
   max-width: 100%;

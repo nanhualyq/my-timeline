@@ -365,3 +365,86 @@ export async function flush(times = 8): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
+
+/**
+ * A viewport the test controls, standing in for `window.matchMedia`.
+ *
+ * The application asks the viewport three separate questions — too narrow for
+ * three columns, coarse and too short for three usable columns, and coarse on
+ * its own — plus whether a pointer can hover. Answering them from one value
+ * cannot express a tablet in landscape, so each answer gets its own list.
+ */
+export class FakeMediaQueryList {
+  matches: boolean;
+  private listeners = new Set<() => void>();
+
+  constructor(matches: boolean) {
+    this.matches = matches;
+  }
+
+  addEventListener(_type: "change", listener: () => void) {
+    this.listeners.add(listener);
+  }
+
+  removeEventListener(_type: "change", listener: () => void) {
+    this.listeners.delete(listener);
+  }
+
+  resize(matches: boolean) {
+    this.matches = matches;
+    for (const listener of this.listeners) listener();
+  }
+
+  get listenerCount(): number {
+    return this.listeners.size;
+  }
+}
+
+export interface ViewportAnswers {
+  /** `(max-width: 800px)` — too narrow for three columns. */
+  narrow?: boolean;
+  /** `(max-width: 1023px) and (pointer: coarse)` — a finger, no room. */
+  coarseNarrow?: boolean;
+  /** `(pointer: coarse)`. */
+  coarse?: boolean;
+  /** `(hover: hover) and (pointer: fine)`. */
+  hover?: boolean;
+}
+
+export interface InstalledViewport {
+  narrow: FakeMediaQueryList;
+  coarseNarrow: FakeMediaQueryList;
+  coarse: FakeMediaQueryList;
+  hover: FakeMediaQueryList;
+  /** Answer every query afresh, as a viewport change would. */
+  set(answers: ViewportAnswers): void;
+}
+
+/** Install `matchMedia` for a test. Call from `beforeEach`, after stubbing. */
+export function installViewport(answers: ViewportAnswers = {}): InstalledViewport {
+  const lists = {
+    narrow: new FakeMediaQueryList(answers.narrow ?? false),
+    coarseNarrow: new FakeMediaQueryList(answers.coarseNarrow ?? false),
+    coarse: new FakeMediaQueryList(answers.coarse ?? false),
+    hover: new FakeMediaQueryList(answers.hover ?? false),
+  };
+
+  vi.stubGlobal("matchMedia", (query: string) => {
+    if (query.includes("hover")) return lists.hover;
+    if (query.includes("pointer: coarse") && query.includes("max-width")) {
+      return lists.coarseNarrow;
+    }
+    if (query.includes("pointer: coarse")) return lists.coarse;
+    return lists.narrow;
+  });
+
+  return {
+    ...lists,
+    set(next: ViewportAnswers) {
+      if (next.narrow !== undefined) lists.narrow.resize(next.narrow);
+      if (next.coarseNarrow !== undefined) lists.coarseNarrow.resize(next.coarseNarrow);
+      if (next.coarse !== undefined) lists.coarse.resize(next.coarse);
+      if (next.hover !== undefined) lists.hover.resize(next.hover);
+    },
+  };
+}

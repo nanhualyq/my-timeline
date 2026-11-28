@@ -9,7 +9,9 @@ import {
   FakeBackend,
   FakeIntersectionObserver,
   flush,
+  installViewport,
   stubScrollGeometry,
+  type InstalledViewport,
 } from "./fakeBackend";
 
 const harness = vi.hoisted(() => ({
@@ -33,33 +35,19 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: async () => undefined }));
 
-/** A viewport the test can resize, standing in for `window.matchMedia`. */
-class FakeMediaQueryList {
-  matches: boolean;
-  private listeners = new Set<() => void>();
+/** The viewport every test in this file starts from: a phone. */
+let viewport: InstalledViewport;
+let backend: FakeBackend;
 
-  constructor(matches: boolean) {
-    this.matches = matches;
-  }
-
-  addEventListener(_type: "change", listener: () => void) {
-    this.listeners.add(listener);
-  }
-
-  removeEventListener(_type: "change", listener: () => void) {
-    this.listeners.delete(listener);
-  }
-
-  resize(matches: boolean) {
-    this.matches = matches;
-    for (const listener of this.listeners) listener();
-  }
+/** A desktop window: wide, three columns, a pointer and a keyboard. */
+function desktop() {
+  viewport.set({ narrow: false, coarseNarrow: false, coarse: false });
 }
 
-let media: FakeMediaQueryList;
-/** A phone has no hovering pointer; the touch layout tests assume that. */
-let hoverMedia: FakeMediaQueryList;
-let backend: FakeBackend;
+/** A phone: narrow, no hovering pointer. */
+function phone() {
+  viewport.set({ narrow: true, coarseNarrow: true, coarse: true });
+}
 
 function build() {
   backend = new FakeBackend({ entries: 12, feeds: 1 });
@@ -90,20 +78,15 @@ beforeEach(() => {
   vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
   stubScrollGeometry(false);
   // Narrow by default in this file: every test here is about the one-pane
-  // layout. `resize(false)` crosses the breakpoint.
-  media = new FakeMediaQueryList(true);
-  hoverMedia = new FakeMediaQueryList(false);
-  // One viewport, two questions asked of it: the width breakpoint and whether
-  // a pointer can hover.
-  vi.stubGlobal("matchMedia", (query: string) =>
-    query.includes("hover") ? hoverMedia : media,
-  );
+  // layout, and a phone is narrow and coarse.
+  viewport = installViewport({ narrow: true, coarseNarrow: true, coarse: true });
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   delete document.documentElement.dataset.layout;
+  delete document.documentElement.dataset.input;
 });
 
 describe("narrow layout", () => {
@@ -130,7 +113,7 @@ describe("narrow layout", () => {
 
   it("still offers the keyboard reference to a narrow layout with a keyboard", async () => {
     // A phone with a physical keyboard, or a narrow desktop window.
-    hoverMedia.matches = true;
+    viewport.hover.matches = true;
     await mountApp();
 
     document.dispatchEvent(
@@ -226,7 +209,7 @@ describe("narrow layout", () => {
     await flush();
     expect(pane(wrapper).isVisible()).toBe(true);
 
-    media.resize(false);
+    desktop();
     await nextTick();
 
     expect(document.documentElement.dataset.layout).toBe("wide");
@@ -241,7 +224,7 @@ describe("narrow layout", () => {
     await wrapper.get(".nav-toggle").trigger("click");
     expect(wrapper.find(".drawer-backdrop").exists()).toBe(true);
 
-    media.resize(false);
+    desktop();
     await nextTick();
 
     expect(wrapper.find(".drawer-backdrop").exists()).toBe(false);
@@ -249,11 +232,11 @@ describe("narrow layout", () => {
   });
 
   it("leaves the reader closed when the viewport becomes narrow with no entry open", async () => {
-    media.matches = false;
+    desktop();
     const wrapper = await mountApp();
     expect(pane(wrapper).isVisible()).toBe(true);
 
-    media.resize(true);
+    phone();
     await nextTick();
 
     expect(pane(wrapper).isVisible()).toBe(false);

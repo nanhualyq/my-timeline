@@ -9,7 +9,9 @@ import {
   FakeBackend,
   FakeIntersectionObserver,
   flush,
+  installViewport,
   stubScrollGeometry,
+  type InstalledViewport,
 } from "./fakeBackend";
 
 const harness = vi.hoisted(() => ({
@@ -33,30 +35,8 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: async () => undefined }));
 
-/** A viewport the test controls, standing in for `window.matchMedia`. */
-class FakeMediaQueryList {
-  matches: boolean;
-  private listeners = new Set<() => void>();
-
-  constructor(matches: boolean) {
-    this.matches = matches;
-  }
-
-  addEventListener(_type: "change", listener: () => void) {
-    this.listeners.add(listener);
-  }
-
-  removeEventListener(_type: "change", listener: () => void) {
-    this.listeners.delete(listener);
-  }
-
-  resize(matches: boolean) {
-    this.matches = matches;
-    for (const listener of this.listeners) listener();
-  }
-}
-
-let media: FakeMediaQueryList;
+/** The viewport every test in this file starts from: a phone. */
+let viewport: InstalledViewport;
 let backend: FakeBackend;
 
 async function mountApp(): Promise<VueWrapper> {
@@ -73,6 +53,16 @@ async function mountApp(): Promise<VueWrapper> {
   return wrapper;
 }
 
+/** A desktop window: wide, three columns, a pointer. */
+function desktop() {
+  viewport.set({ narrow: false, coarseNarrow: false, coarse: false });
+}
+
+/** A tablet in landscape: three columns operated by a finger. */
+function tablet() {
+  viewport.set({ narrow: false, coarseNarrow: false, coarse: true });
+}
+
 function sidebar(wrapper: VueWrapper) {
   return wrapper.findComponent(Sidebar);
 }
@@ -85,32 +75,58 @@ function list(wrapper: VueWrapper) {
   return wrapper.findComponent(EntryList);
 }
 
+function row_panels(wrapper: VueWrapper) {
+  return wrapper.findAll(".swipe-panel").length;
+}
+
 beforeEach(() => {
   FakeIntersectionObserver.reset();
   vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
   stubScrollGeometry(false);
-  media = new FakeMediaQueryList(true);
-  vi.stubGlobal("matchMedia", () => media);
+  viewport = installViewport({ narrow: true, coarseNarrow: true, coarse: true });
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   delete document.documentElement.dataset.layout;
+  delete document.documentElement.dataset.input;
 });
 
 describe("touch layout controls", () => {
-  it("gives every entry-row control an accessible name and a touch target", async () => {
+  it("gives a touch row no controls of its own", async () => {
+    const wrapper = await mountApp();
+
+    // The row's actions are the drags and the long-press menu, so nothing sits
+    // on the row spending width until a finger asks for it.
+    expect(wrapper.find(".entry .star").exists()).toBe(false);
+    expect(wrapper.find(".entry .mark-above").exists()).toBe(false);
+  });
+
+  it("reveals the drag actions behind a touch row", async () => {
+    const wrapper = await mountApp();
+    const [newest, second] = wrapper.findAll(".entry");
+
+    // The newest row has nothing above it, so its rightward drag would do
+    // nothing and says so.
+    expect(newest.find(".swipe-panel.leading").text()).toBe("Nothing unread above");
+    expect(second.find(".swipe-panel.leading").text()).toBe(
+      "Mark 1 entry above read",
+    );
+    expect(second.find(".swipe-panel.trailing").text()).toBe("Star");
+  });
+
+  it("keeps the row's controls, with their names, on a pointer layout", async () => {
+    desktop();
     const wrapper = await mountApp();
 
     const star = wrapper.get(".entry .star");
     expect(star.attributes("aria-label")).toBe("Star entry");
-    expect(star.classes()).toContain("touch-target");
 
     const markAbove = wrapper.get(".entry .mark-above");
     // Count-correct wording: the second row has exactly one unread row above it.
     expect(markAbove.attributes("aria-label")).toBe("Mark 1 entry above as read");
-    expect(markAbove.classes()).toContain("touch-target");
+    expect(row_panels(wrapper)).toBe(0);
   });
 
   it("gives the header controls accessible names", async () => {
@@ -153,7 +169,7 @@ describe("touch layout controls", () => {
   });
 
   it("keeps the wide layout's controls compact", async () => {
-    media.matches = false;
+    desktop();
     const wrapper = await mountApp();
 
     // No touch sizing, and no drawer toggle: the desktop layout is unchanged.
@@ -175,12 +191,53 @@ describe("touch layout controls", () => {
   });
 
   it("does not mount the reading screen's back control on the wide layout", async () => {
-    media.matches = false;
+    desktop();
     const wrapper = await mountApp();
     await wrapper.get(".entry").trigger("click");
     await flush();
     await nextTick();
 
     expect(pane(wrapper).find(".back").exists()).toBe(false);
+  });
+});
+
+describe("wide touch layout", () => {
+  it("publishes three columns and a touch input for a coarse pointer", async () => {
+    tablet();
+    await mountApp();
+
+    expect(document.documentElement.dataset.layout).toBe("wide");
+    expect(document.documentElement.dataset.input).toBe("touch");
+  });
+
+  it("tells the list its columns are wide but its input is touch", async () => {
+    tablet();
+    const wrapper = await mountApp();
+
+    expect(list(wrapper).props("narrow")).toBe(false);
+    expect(list(wrapper).props("touch")).toBe(true);
+    // The drawer toggle belongs to the one-pane layout, so it stays away.
+    expect(wrapper.find(".nav-toggle").exists()).toBe(false);
+  });
+
+  it("shows one pane on a landscape phone", async () => {
+    // A landscape phone measures about 915 x 412 CSS pixels: wide enough by
+    // the column breakpoint, far too short for three usable columns.
+    viewport.set({ narrow: false, coarseNarrow: true, coarse: true });
+    const wrapper = await mountApp();
+
+    expect(document.documentElement.dataset.layout).toBe("narrow");
+    expect(list(wrapper).props("narrow")).toBe(true);
+    expect(list(wrapper).props("touch")).toBe(true);
+    expect(pane(wrapper).isVisible()).toBe(false);
+  });
+
+  it("keeps the desktop window on a pointer", async () => {
+    desktop();
+    const wrapper = await mountApp();
+
+    expect(document.documentElement.dataset.input).toBe("pointer");
+    expect(list(wrapper).props("touch")).toBe(false);
+    expect(pane(wrapper).props("touch")).toBe(false);
   });
 });

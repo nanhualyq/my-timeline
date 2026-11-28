@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Sidebar from "./components/Sidebar.vue";
 import EntryList from "./components/EntryList.vue";
 import ReadingPane from "./components/ReadingPane.vue";
 import FeedEditDialog from "./components/FeedEditDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import KeyboardHelp from "./components/KeyboardHelp.vue";
+import UndoBar from "./components/UndoBar.vue";
+import TouchMenu from "./components/TouchMenu.vue";
 import {
   EMPTY_KEY_STATE,
   isEditableTarget,
@@ -44,8 +46,9 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { message } from "@tauri-apps/plugin-dialog";
 import { runBackgroundSync } from "./lib/background-sync";
-import { useLayout, useMediaQuery, HOVER_MEDIA_QUERY } from "./lib/viewport";
+import { useViewport, useMediaQuery, HOVER_MEDIA_QUERY } from "./lib/viewport";
 import { createBackStack, type BackStack } from "./lib/back-stack";
+import type { MenuItem } from "./lib/menu";
 
 /** Entries per batch. A constant: the app has no settings persistence, and
  *  batch size is not worth adding one for. */
@@ -58,6 +61,10 @@ const BURST_FLUSH_MS = 120;
 
 /** How long a `g` waits for its second key before it is forgotten. */
 const PREFIX_TIMEOUT_MS = 1000;
+
+/** How long a batch mark can be taken back. Long enough to notice a mistake,
+ *  short enough that the offer never becomes furniture. */
+const UNDO_WINDOW_MS = 3000;
 
 const feeds = ref<Feed[]>([]);
 const folders = ref<Folder[]>([]);
@@ -86,12 +93,16 @@ const counts = ref<EntryCounts>({
 const busy = ref(false);
 const loadError = ref<string | null>(null);
 const editingFeed = ref<Feed | null>(null);
+/** The row whose long-press menu is open, and where it sits in the list. */
+const menuRow = ref<{ entry: EntryListItem; index: number } | null>(null);
 const settingsOpen = ref(false);
 const helpOpen = ref(false);
 
-/** The published layout: wide shows three columns, narrow shows one pane. */
-const layout = useLayout();
-const narrow = computed(() => layout.value === "narrow");
+/** The published viewport: `layout` decides the columns, `input` decides how
+ *  the reader operates them. A tablet in landscape is wide and touch. */
+const viewport = useViewport();
+const narrow = computed(() => viewport.layout.value === "narrow");
+const touch = computed(() => viewport.input.value === "touch");
 
 /** False on a touch screen: nothing there can be hovered, and a reader holding
  *  a phone has no keyboard to press a shortcut on. */
@@ -140,14 +151,73 @@ function closeDrawer() {
   drawerOpen.value = false;
 }
 
-/** Leave the reading screen. The selection is kept, so the row the reader was
- *  on stays marked and reopening it is one tap away. */
+/**
+ * Leave the reading screen. The selection is kept, so the row the reader was
+ * on stays marked and reopening it is one tap away.
+ *
+ * The list comes back where the reader left it, except that swiping through
+ * articles moves the cursor and the list has to follow: a list still parked
+ * three screens above what was just read would be a list that lost its place.
+ * `revealEntry` runs post-render, because the list is only measurable once it
+ * is on screen again.
+ */
 function closeReader() {
   readerOpen.value = false;
+  const id = selectedEntryId.value;
+  if (id === null) return;
+  void nextTick(() => listRef.value?.revealEntry(id));
 }
 
 function openReader() {
   if (narrow.value) readerOpen.value = true;
+}
+
+/**
+ * The row's long-press menu: the same two row actions the pointer layout puts
+ * on the row itself, offered where a finger cannot hover and where an assistive
+ * technology would swallow a horizontal drag.
+ */
+function openRowMenu(entry: EntryListItem, index: number) {
+  menuRow.value = { entry, index };
+}
+
+function closeRowMenu() {
+  menuRow.value = null;
+}
+
+/** Unread rows above the menu's row, which is what its batch item reaches. */
+const menuUnreadAbove = computed(() => {
+  const row = menuRow.value;
+  if (!row) return 0;
+  return entries.value.slice(0, row.index).filter((e) => !e.is_read).length;
+});
+
+const menuItems = computed<MenuItem[]>(() => {
+  const row = menuRow.value;
+  if (!row) return [];
+  const items: MenuItem[] = [
+    {
+      key: "star",
+      label: row.entry.is_starred ? "Unstar entry" : "Star entry",
+    },
+  ];
+  // Same condition as the visible chip: nothing to mark, nothing offered.
+  if (batchActionsAvailable.value && menuUnreadAbove.value > 0) {
+    const count = menuUnreadAbove.value;
+    items.push({
+      key: "mark-above",
+      label: `Mark ${count} ${count === 1 ? "entry" : "entries"} above read`,
+    });
+  }
+  return items;
+});
+
+function chooseRowMenu(key: string) {
+  const row = menuRow.value;
+  menuRow.value = null;
+  if (!row) return;
+  if (key === "star") void toggleStar(row.entry);
+  else if (key === "mark-above") markAboveRead(row.index);
 }
 
 /**
@@ -173,6 +243,7 @@ const openLayers = computed<string[]>(() => {
   const layers: string[] = [];
   if (narrow.value && drawerOpen.value) layers.push("drawer");
   if (narrow.value && readerOpen.value) layers.push("reader");
+  if (menuRow.value) layers.push("menu");
   if (settingsOpen.value || editingFeed.value !== null || helpOpen.value) {
     layers.push("dialog");
   }
@@ -185,6 +256,10 @@ function closeTopLayer() {
     settingsOpen.value = false;
     editingFeed.value = null;
     helpOpen.value = false;
+    return;
+  }
+  if (menuRow.value) {
+    menuRow.value = null;
     return;
   }
   if (narrow.value && readerOpen.value) {
@@ -465,6 +540,29 @@ async function applyRead(entry: { id: number }, isRead: boolean) {
   }
 }
 
+/** The reading pane's star control: the open entry, which is a separate object
+ *  from its list row. */
+function toggleStarOpenEntry() {
+  const entry = selectedEntry.value;
+  if (entry) void toggleStar(entry);
+}
+
+/** A horizontal swipe in the reading pane is a cursor move, so it inherits
+ *  marking-on-open, the coalesced write, and paging past the loaded rows. */
+function stepEntry(delta: number) {
+  void stepCursor(delta);
+}
+
+/** Whether the open entry has neighbours, for the reading screen's indication
+ *  of what a swipe would do. `hasMore` counts as a next entry: swiping there
+ *  loads the batch that holds it. */
+const hasPreviousEntry = computed(() => cursorIndex() > 0);
+const hasNextEntry = computed(() => {
+  const index = cursorIndex();
+  if (index < 0) return false;
+  return index < entries.value.length - 1 || hasMore.value;
+});
+
 function toggleRead() {
   const entry = selectedEntry.value;
   if (entry) void applyRead(entry, !entry.is_read);
@@ -505,6 +603,57 @@ function markAboveRead(index: number) {
   );
 }
 
+/**
+ * The batch mark that can still be taken back, and the timer that retires the
+ * offer. One slot, deliberately: a second batch replaces the first rather than
+ * stacking, because a three-second window cannot realistically hold two.
+ */
+const pendingUndo = ref<{ ids: number[] } | null>(null);
+let undoTimer: ReturnType<typeof setTimeout> | null = null;
+
+function retireUndo() {
+  if (undoTimer !== null) {
+    clearTimeout(undoTimer);
+    undoTimer = null;
+  }
+  pendingUndo.value = null;
+}
+
+function armUndo(ids: number[]) {
+  retireUndo();
+  pendingUndo.value = { ids: [...ids] };
+  undoTimer = setTimeout(() => {
+    undoTimer = null;
+    pendingUndo.value = null;
+  }, UNDO_WINDOW_MS);
+}
+
+/**
+ * Take back the last batch mark.
+ *
+ * Only the entries that batch recorded are written, so anything marked or
+ * unmarked by another path in the meantime keeps its state. In an unread list
+ * the marked rows have already left the page, so their read state alone would
+ * be invisible: the list is refilled instead of patched, which costs the scroll
+ * position and shows the reader what came back.
+ */
+async function undoBatchRead() {
+  const pending = pendingUndo.value;
+  if (!pending) return;
+  retireUndo();
+  try {
+    await Promise.all(pending.ids.map((id) => setRead(id, false)));
+    for (const id of pending.ids) patchEntry(id, { is_read: false });
+    if (activeView() === "unread") {
+      startOver();
+      return;
+    }
+    await refreshCounts();
+  } catch (e) {
+    loadError.value = String(e);
+  }
+}
+
 async function applyBatchRead(ids: number[]) {
   if (ids.length === 0) return;
   try {
@@ -518,12 +667,15 @@ async function applyBatchRead(ids: number[]) {
       startOver();
     }
     await refreshCounts();
+    // Armed last, so the offer appears only once the write has landed.
+    armUndo(ids);
   } catch (e) {
     loadError.value = String(e);
   }
 }
 
-async function toggleStar(entry: EntryListItem) {
+/** Star anything with a star and an id — a list row or the open entry. */
+async function toggleStar(entry: { id: number; is_starred: boolean }) {
   try {
     const next = !entry.is_starred;
     await setStarred(entry.id, next);
@@ -824,9 +976,9 @@ function runAction(action: Action, count: number | null) {
       paneRef.value?.scrollByScreens(-steps);
       return;
     case "toggle-help":
-      // The shortcut reference is not offered on a touch-only layout: there
-      // is no keyboard to use it with.
-      if (narrow.value && !hoverInput.value) return;
+      // The shortcut reference is not offered on a touch layout: there is no
+      // keyboard to use it with.
+      if (touch.value && !hoverInput.value) return;
       helpOpen.value = true;
       return;
     case "toggle-read":
@@ -1005,6 +1157,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("blur", flushOnLeave);
   window.removeEventListener("beforeunload", flushOnLeave);
   clearPrefixTimer();
+  retireUndo();
   void flushBurst();
 });
 
@@ -1056,6 +1209,7 @@ onBeforeUnmount(() => {
       :show-feed-label="showEntryFeedLabel"
       :batch-actions-available="batchActionsAvailable"
       :narrow="narrow"
+      :touch="touch"
       @select="selectEntry"
       @toggle-star="toggleStar"
       @refresh-all="doRefreshAll"
@@ -1064,6 +1218,7 @@ onBeforeUnmount(() => {
       @mark-rendered="markRenderedRead"
       @mark-above="markAboveRead"
       @open-nav="openDrawer"
+      @context-menu="openRowMenu"
     />
     <ReadingPane
       v-show="!narrow || readerOpen"
@@ -1071,9 +1226,15 @@ onBeforeUnmount(() => {
       :entry="selectedEntry"
       :feed="selectedFeed"
       :narrow="narrow"
+      :touch="touch"
+      :has-previous="hasPreviousEntry"
+      :has-next="hasNextEntry"
       @toggle-read="toggleRead"
+      @toggle-star="toggleStarOpenEntry"
       @open-link="openLink"
       @close="closeReader"
+      @previous="stepEntry(-1)"
+      @next="stepEntry(1)"
     />
     <FeedEditDialog
       v-if="editingFeed"
@@ -1089,6 +1250,18 @@ onBeforeUnmount(() => {
       @changed="reload"
     />
     <KeyboardHelp v-if="helpOpen" @close="helpOpen = false" />
+    <TouchMenu
+      v-if="menuRow"
+      :title="menuRow.entry.title"
+      :items="menuItems"
+      @select="chooseRowMenu"
+      @close="closeRowMenu"
+    />
+    <UndoBar
+      v-if="pendingUndo"
+      :count="pendingUndo.ids.length"
+      @undo="undoBatchRead"
+    />
   </main>
 </template>
 
@@ -1105,9 +1278,9 @@ body {
   height: 100%;
 }
 
-/* The minimum hit area for a fingertip. Applied only on the narrow layout, so
-   a wide layout keeps its compact controls; one definition keeps every touch
-   target the same size. */
+/* The minimum hit area for a fingertip. Applied only where the primary pointer
+   is a finger, so a pointer layout keeps its compact controls; one definition
+   keeps every touch target the same size. */
 .touch-target {
   min-width: 44px;
   min-height: 44px;
@@ -1120,16 +1293,17 @@ body {
    rather than to a `touch-target` class. Written once here so a control added
    to a header, a pane, or a dialog cannot quietly end up too small to tap —
    measured on the emulator, the header buttons were 28 CSS px tall. */
-:root[data-layout="narrow"] .list-header button,
-:root[data-layout="narrow"] .pane-header button,
-:root[data-layout="narrow"] .pane-actions .btn,
-:root[data-layout="narrow"] .dialog button,
-:root[data-layout="narrow"] .settings-btn,
-:root[data-layout="narrow"] .row-menu-item {
+:root[data-input="touch"] .list-header button,
+:root[data-input="touch"] .pane-header button,
+:root[data-input="touch"] .pane-actions .btn,
+:root[data-input="touch"] .dialog button,
+:root[data-input="touch"] .settings-btn,
+:root[data-input="touch"] .row-menu-trigger,
+:root[data-input="touch"] .row-menu-item {
   min-width: 44px;
   min-height: 44px;
 }
-:root[data-layout="narrow"] .feed-item {
+:root[data-input="touch"] .feed-item {
   min-height: 44px;
 }
 </style>

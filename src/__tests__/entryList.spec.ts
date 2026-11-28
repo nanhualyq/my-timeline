@@ -40,6 +40,7 @@ function render(overrides: Partial<Record<string, unknown>> = {}): VueWrapper {
       showFeedLabel: true,
       batchActionsAvailable: true,
       narrow: false,
+      touch: false,
       ...overrides,
     },
   });
@@ -173,6 +174,38 @@ describe("row detail", () => {
     expect(row.find(".entry-feed").text()).toBe("Feed One");
     expect(row.find(".entry-date").text()).toBe("20m");
     expect(row.find(".star").exists()).toBe(true);
+  });
+
+  it("shows the starred state as a mark where the row has no star button", () => {
+    const wrapper = render({
+      touch: true,
+      entries: [makeRow(1, { is_starred: true }), makeRow(2)],
+    });
+
+    const [starred, plain] = wrapper.findAll(".entry");
+    expect(starred.find(".star").exists()).toBe(false);
+    expect(starred.find(".entry-star-mark").exists()).toBe(true);
+    // The glyph is decorative; the state is text for a screen reader.
+    expect(starred.find(".entry-star-mark").text()).toContain("Starred");
+    expect(plain.find(".entry-star-mark").exists()).toBe(false);
+  });
+
+  it("does not repeat the starred state beside its own button", () => {
+    const wrapper = render({ entries: [makeRow(1, { is_starred: true })] });
+
+    const row = wrapper.find(".entry");
+    expect(row.find(".star").classes()).toContain("starred");
+    expect(row.find(".entry-star-mark").exists()).toBe(false);
+  });
+
+  it("keeps the row's width for its text on a touch layout", () => {
+    const wrapper = render({ touch: true, entries: [makeRow(1)] });
+
+    const row = wrapper.find(".entry");
+    // Neither control exists to reserve space for, so nothing pads for one.
+    expect(row.find(".star").exists()).toBe(false);
+    expect(row.find(".mark-above").exists()).toBe(false);
+    expect(row.classes()).toContain("touch-row");
   });
 
   it("puts the full timestamp on the time label", () => {

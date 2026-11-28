@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import type { EntryListItem } from "../api";
 import { formatRelativeTime, fullTimestamp } from "../lib/time";
+import { useHorizontalDrag } from "../lib/gestures";
 
 const props = defineProps<{
   entries: EntryListItem[];
@@ -25,9 +26,11 @@ const props = defineProps<{
   /** True when the current list is a triage queue (a feed, a folder, or the
    *  global unread view), where batch marking belongs. */
   batchActionsAvailable: boolean;
-  /** True on the one-pane layout: the header hosts the drawer toggle and the
-   *  row controls stop depending on hover. */
+  /** True on the one-pane layout: the header hosts the drawer toggle. */
   narrow: boolean;
+  /** True where the primary pointer is a finger: rows stop depending on hover
+   *  and their actions are gestures and the long-press menu. */
+  touch: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -42,6 +45,8 @@ const emit = defineEmits<{
   markAbove: [index: number];
   /** Narrow layout only: the reader wants the feed drawer. */
   openNav: [];
+  /** Touch layout only: a long press asked for the row's menu. */
+  contextMenu: [entry: EntryListItem, index: number];
 }>();
 
 /** The scrolling list and the row at its end that asks for another batch. */
@@ -67,6 +72,16 @@ function revealCursor(id: number | null) {
 watch(() => props.selectedEntryId, revealCursor, { flush: "post" });
 
 /**
+ * Reveal a row on request, not only when the cursor moves.
+ *
+ * A move made while the list was hidden — a reader swiping through articles on
+ * the narrow layout — cannot scroll it: `scrollIntoView` does nothing on a
+ * `display: none` subtree. The container therefore asks once the list is back
+ * on screen, which is also the only moment the reveal is worth anything.
+ */
+defineExpose({ visibleRowCount, revealEntry: revealCursor });
+
+/**
  * Rows that fit in the list box. Measured from a rendered row rather than from
  * the row height in the stylesheet, so the stylesheet stays the only place
  * that height is defined.
@@ -80,9 +95,7 @@ function visibleRowCount(): number {
   return Math.max(1, Math.floor(box.clientHeight / rowHeight));
 }
 
-// The container drives movement, so it needs the one measurement only this
-// component can take.
-defineExpose({ visibleRowCount });
+
 
 /**
  * Clock the relative labels read from. One minute is the finest bucket the
@@ -90,6 +103,58 @@ defineExpose({ visibleRowCount });
  * this a list left open would keep claiming an entry is "5m" old.
  */
 const now = ref(Date.now());
+
+/**
+ * The row gestures. One instance for the whole list rather than one per row:
+ * the samples arrive on the window, and only the surface under the finger is
+ * ever reported.
+ *
+ * A leftward drag toggles the row's star, a rightward drag marks the rendered
+ * rows above it read — the same two actions the pointer layout puts on the
+ * row's controls, so the two layouts cannot drift apart.
+ */
+const {
+  activeKey: dragKey,
+  offset: dragOffset,
+  dragging: dragActive,
+  onPointerDown: startDrag,
+} = useHorizontalDrag({
+  enabled: () => props.touch,
+  onCommit: (target, direction) => {
+    const index = props.entries.findIndex((row) => row.id === target.key);
+    if (index < 0) return;
+    const row = props.entries[index];
+    if (direction === "left") emit("toggleStar", row);
+    else emit("markAbove", index);
+  },
+  onLongPress: (target) => {
+    const index = props.entries.findIndex((row) => row.id === target.key);
+    if (index < 0) return;
+    emit("contextMenu", props.entries[index], index);
+  },
+});
+
+/** Where the dragged surface sits, in pixels. Only the row under the finger
+ *  moves; every other row keeps the resting position. */
+function dragStyle(entry: EntryListItem): Record<string, string> {
+  const dx = dragKey.value === entry.id ? dragOffset.value : 0;
+  return { "--drag-x": `${dx}px` };
+}
+
+/** Which action the drag in progress would commit, for the revealed panel. */
+function dragIntentFor(entry: EntryListItem): "left" | "right" | null {
+  if (dragKey.value !== entry.id || !dragActive.value) return null;
+  return dragOffset.value < 0 ? "left" : "right";
+}
+
+function onRowPointerDown(
+  event: PointerEvent,
+  entry: EntryListItem,
+  _index: number,
+) {
+  if (!props.touch) return;
+  startDrag(event, { key: entry.id });
+}
 
 function sentinelVisible(): boolean {
   const row = sentinel.value?.getBoundingClientRect();
@@ -182,6 +247,19 @@ function unreadAbove(index: number): number {
   return props.entries.slice(0, index).filter((e) => !e.is_read).length;
 }
 
+/** What a rightward drag on this row would do, in the reader's words. */
+function markAboveLabel(index: number): string {
+  const count = unreadAbove(index);
+  return count === 0 ? "Nothing unread above" : `Mark ${plural(count, "entry", "entries")} above read`;
+}
+
+/** A touch row has no star button, so its starred state is carried by a mark.
+ *  Where the button exists it already says the same thing — showing both would
+ *  state it twice. */
+function showsStarMark(entry: EntryListItem): boolean {
+  return props.touch && entry.is_starred;
+}
+
 /** `1 entry` / `2 entries`: these labels are read out by screen readers and
  *  shown as tooltips, so "Mark 1 entries" is a visible mistake. */
 function plural(count: number, one: string, many: string): string {
@@ -249,51 +327,82 @@ function plural(count: number, one: string, many: string): string {
           active: entry.id === selectedEntryId,
           unread: !entry.is_read,
           'narrow-row': narrow,
+          'touch-row': touch,
+          dragging: dragIntentFor(entry) !== null,
         }"
+        :style="dragStyle(entry)"
         @click="emit('select', entry)"
+        @pointerdown="onRowPointerDown($event, entry, index)"
       >
-        <!-- Decorative: the title carries the meaning. Lazy so covers are only
-             fetched for rows that actually come into view. -->
-        <img
-          v-if="coverFor(entry)"
-          class="entry-cover"
-          :src="coverFor(entry) ?? ''"
-          alt=""
-          loading="lazy"
-          @error="markCoverBroken(entry.id)"
-        />
-        <div class="entry-body">
-          <span class="entry-title">{{ entry.title }}</span>
-          <span v-if="entry.excerpt" class="entry-excerpt">{{ entry.excerpt }}</span>
-          <span class="entry-meta">
-            <span v-if="feedLabel(entry)" class="entry-feed">{{ feedLabel(entry) }}</span>
-            <span class="entry-date" :title="fullTime(entry)">{{ fmtTime(entry) }}</span>
-          </span>
+        <!-- Behind the row and revealed by the drag: what a release would do.
+             On a touch layout these replace the row's two controls, so the row
+             gives no width to either until a finger asks for one. -->
+        <template v-if="touch">
+          <div
+            class="swipe-panel leading"
+            :class="{ revealed: dragIntentFor(entry) === 'right' }"
+            aria-hidden="true"
+          >
+            {{ markAboveLabel(index) }}
+          </div>
+          <div
+            class="swipe-panel trailing"
+            :class="{ revealed: dragIntentFor(entry) === 'left' }"
+            aria-hidden="true"
+          >
+            {{ entry.is_starred ? "Unstar" : "Star" }}
+          </div>
+        </template>
+        <div class="entry-surface">
+          <!-- Decorative: the title carries the meaning. Lazy so covers are
+               only fetched for rows that actually come into view. -->
+          <img
+            v-if="coverFor(entry)"
+            class="entry-cover"
+            :src="coverFor(entry) ?? ''"
+            alt=""
+            loading="lazy"
+            @error="markCoverBroken(entry.id)"
+          />
+          <div class="entry-body">
+            <span class="entry-title">{{ entry.title }}</span>
+            <span v-if="entry.excerpt" class="entry-excerpt">{{ entry.excerpt }}</span>
+            <span class="entry-meta">
+              <span v-if="feedLabel(entry)" class="entry-feed">{{ feedLabel(entry) }}</span>
+              <span class="entry-date" :title="fullTime(entry)">{{ fmtTime(entry) }}</span>
+              <span v-if="showsStarMark(entry)" class="entry-star-mark">
+                <span aria-hidden="true">&#9733;</span>
+                <span class="sr-only">Starred</span>
+              </span>
+            </span>
+          </div>
+          <!-- The pointer layout's controls: a pointer aims at a compact
+               button and hovers to reveal one. A touch row has neither. -->
+          <template v-if="!touch">
+            <button
+              class="star"
+              :class="{ starred: entry.is_starred }"
+              :title="entry.is_starred ? 'Unstar' : 'Star'"
+              :aria-label="entry.is_starred ? 'Unstar entry' : 'Star entry'"
+              @click.stop="emit('toggleStar', entry)"
+            >
+              {{ entry.is_starred ? "★" : "☆" }}
+            </button>
+            <!-- Floats over the row and reserves no column, so a row without
+                 the action keeps its previous layout. The arrow carries the
+                 count the action would mark. -->
+            <button
+              v-if="batchActionsAvailable && unreadAbove(index) > 0"
+              class="mark-above"
+              :disabled="busy"
+              :title="`Mark the ${plural(unreadAbove(index), 'unread entry', 'unread entries')} above this one as read`"
+              :aria-label="`Mark ${plural(unreadAbove(index), 'entry', 'entries')} above as read`"
+              @click.stop="emit('markAbove', index)"
+            >
+              &#8593;{{ unreadAbove(index) }}
+            </button>
+          </template>
         </div>
-        <button
-          class="star"
-          :class="{ starred: entry.is_starred, 'touch-target': narrow }"
-          :title="entry.is_starred ? 'Unstar' : 'Star'"
-          :aria-label="entry.is_starred ? 'Unstar entry' : 'Star entry'"
-          @click.stop="emit('toggleStar', entry)"
-        >
-          {{ entry.is_starred ? "\u2605" : "\u2606" }}
-        </button>
-        <!-- Floats over the row and reserves no column, so a row without the
-             action keeps its previous layout. The arrow carries the count the
-             action would mark. Revealed on hover where a hover exists, and
-             always present on a touch layout, where there is nothing to hover. -->
-        <button
-          v-if="batchActionsAvailable && unreadAbove(index) > 0"
-          class="mark-above"
-          :class="{ 'touch-target': narrow }"
-          :disabled="busy"
-          :title="`Mark the ${plural(unreadAbove(index), 'unread entry', 'unread entries')} above this one as read`"
-          :aria-label="`Mark ${plural(unreadAbove(index), 'entry', 'entries')} above as read`"
-          @click.stop="emit('markAbove', index)"
-        >
-          &#8593;{{ unreadAbove(index) }}
-        </button>
       </li>
       <li v-if="entries.length === 0" class="empty">No entries.</li>
       <!-- Always mounted so the observer wiring never has to be rebuilt;
@@ -416,9 +525,11 @@ function plural(count: number, one: string, many: string): string {
   min-height: 0;
 }
 .entry {
+  /* The surface fills the row and translates while it is dragged; the panels
+     behind it are what the drag reveals. */
+  position: relative;
   display: flex;
-  align-items: flex-start;
-  gap: 0.6rem;
+  align-items: stretch;
   /* Fixed height is what keeps lazy image loading from shifting the rows the
      reader is looking at: a cover arriving late cannot resize its row.
      The number is the worst case, not an arbitrary preference: 2-line title
@@ -432,20 +543,78 @@ function plural(count: number, one: string, many: string): string {
   height: 7.5rem;
   overflow: hidden;
   box-sizing: border-box;
-  /* The row-level batch action floats over the row on hover instead of
-     taking a flex column, so the row layout does not pay for a control the
-     reader only uses occasionally. */
-  position: relative;
-  padding: 0.55rem 0.75rem;
+  /* The pointer layout's row-level batch action floats over the row on hover
+     instead of taking a flex column, so the row layout does not pay for a
+     control the reader only uses occasionally. */
   border-bottom: 1px solid #eee;
   cursor: pointer;
+  /* Vertical scrolling stays the browser's; the horizontal axis is ours. */
+  touch-action: pan-y;
+}
+/* A long press on a touch row is the row's menu, so the row's text must not
+   start a selection instead. */
+.entry.touch-row {
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.entry-surface {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  flex: 1;
+  min-width: 0;
+  padding: 0.55rem 0.75rem;
+  box-sizing: border-box;
+  /* Opaque, so the panels behind it are only visible where a drag has moved
+     it aside. */
+  background: #fff;
+  transform: translateX(var(--drag-x, 0px));
+}
+.entry-surface,
+.swipe-panel {
+  /* A drag must not fight the browser's own scroll animation. */
+  transition: transform 120ms ease-out;
+}
+.entry.dragging .entry-surface,
+.entry.dragging .swipe-panel {
+  transition: none;
+}
+.entry.dragging .entry-surface {
+  /* The finger owns the surface: no text selection under it either. */
+  user-select: none;
+}
+/* What the drag would commit. Behind the surface, in the direction the finger
+   is pulling the row away from. */
+.swipe-panel {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 1rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  opacity: 0;
+  pointer-events: none;
+}
+.swipe-panel.revealed {
+  opacity: 1;
+}
+.swipe-panel.leading {
+  justify-content: flex-start;
+  background: #e8f1ff;
+  color: #1d5fc4;
+}
+.swipe-panel.trailing {
+  justify-content: flex-end;
+  background: #fff4d8;
+  color: #8a6508;
 }
 @media (hover: hover) and (pointer: fine) {
-  .entry:hover {
+  .entry:hover .entry-surface {
     background: #f5f7fa;
   }
 }
-.entry:active {
+.entry:active .entry-surface {
   background: #eef2f7;
 }
 .entry.narrow-row {
@@ -453,7 +622,7 @@ function plural(count: number, one: string, many: string): string {
      its content is short; the existing fixed height already exceeds 44px. */
   min-height: 44px;
 }
-.entry.active {
+.entry.active .entry-surface {
   background: #e3efff;
 }
 .entry-cover {
@@ -526,6 +695,28 @@ function plural(count: number, one: string, many: string): string {
 .entry-date {
   flex-shrink: 0;
 }
+/* A touch row's starred state, once the row no longer carries a star button.
+   The glyph is decorative; the label beside it is what a screen reader reads. */
+.entry-star-mark {
+  flex-shrink: 0;
+  color: #d4a017;
+}
+.entry-date + .entry-star-mark::before,
+.entry-feed + .entry-star-mark::before {
+  content: "· ";
+  color: #888;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 .star {
   border: none;
   background: transparent;
@@ -542,22 +733,6 @@ function plural(count: number, one: string, many: string): string {
     background: #eee;
     color: #d4a017;
   }
-}
-/* Enlarged to a touch target only where there is no mouse to aim with; the
-   wide layout keeps its compact control so the row does not change. The
-   minimum hit area itself comes from the global `.touch-target` rule. */
-.narrow-row .mark-above {
-  /* `right` clears the star's widened box. */
-  right: 2.9rem;
-  top: 0.1rem;
-  border-radius: 22px;
-  font-size: 0.75rem;
-}
-/* The chip is always on screen here, so the text has to stop before it instead
-   of running underneath: on desktop the chip only exists while the pointer is
-   on the row, which is why the wide layout needs no such gap. */
-.narrow-row .entry-body {
-  padding-right: 2.5rem;
 }
 .star.starred {
   color: #d4a017;
@@ -580,8 +755,8 @@ function plural(count: number, one: string, many: string): string {
   opacity: 0;
   pointer-events: none;
 }
-/* Only a device with a real pointer can hover, so only there is the control
-   revealed by pointing at the row. */
+/* Only a device with a real pointer can hover, so only there the control is
+   revealed by pointing at the row. A touch row does not render it at all. */
 @media (hover: hover) and (pointer: fine) {
   .entry:hover .mark-above,
   .mark-above:focus-visible {
@@ -591,12 +766,6 @@ function plural(count: number, one: string, many: string): string {
   .mark-above:hover:not(:disabled) {
     background: #dbe9ff;
   }
-}
-/* A touch row has nothing to hover with: the action is always on screen and
-   always tappable. */
-.narrow-row .mark-above {
-  opacity: 1;
-  pointer-events: auto;
 }
 .mark-above:disabled {
   opacity: 0;
