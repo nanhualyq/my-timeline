@@ -8,6 +8,7 @@ mod webdav;
 
 use reader::{AddFeedResult, SharedConn};
 use std::sync::{Arc, Mutex};
+use tauri::utils::config::{AppDirectoriesOverride, AppDirectoryOverrides};
 use tauri::Manager;
 
 fn shared_conn(app: &tauri::AppHandle) -> Result<SharedConn, String> {
@@ -322,6 +323,34 @@ fn sync_status(app: tauri::AppHandle) -> Result<Option<sync::SyncStatus>, String
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let mut context = tauri::generate_context!();
+
+    // Debug desktop builds must not share the release install's data: both the
+    // database and the WebView2 profile live in directories derived from the
+    // bundle identifier, which `tauri dev` does not override.
+    //
+    // The profile matters beyond privacy: WebView2 keeps one browser process per
+    // user data folder and rejects a second environment whose creation options
+    // differ — adding `--remote-debugging-port` is enough — so with a release
+    // app left running, dev webview creation fails with HRESULT 0x8007139F
+    // (ERROR_INVALID_STATE). Pointing the debug build at its own directories is
+    // what lets it start, and debug over CDP, while production keeps running.
+    //
+    // Desktop only. On Android the data dir is the app's own per-package
+    // directory, so a debug and a release install of the same package can never
+    // coexist; asking for a sibling directory (…-dev) lands outside the app's
+    // sandbox, where creating it fails and the database cannot be opened at all.
+    let desktop_debug =
+        cfg!(debug_assertions) && !cfg!(any(target_os = "android", target_os = "ios"));
+    if desktop_debug {
+        context.config_mut().app.app_directories_override =
+            Some(AppDirectoriesOverride::Directories(AppDirectoryOverrides {
+                data: Some("$DATA/com.mytimeline.app-dev".into()),
+                local_data: Some("$LOCALDATA/com.mytimeline.app-dev".into()),
+                ..Default::default()
+            }));
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -331,22 +360,6 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .map_err(|e| format!("app data dir: {e}"))?;
-            // Debug builds must not share the production database: the data dir
-            // is derived from the bundle identifier, which `tauri dev` does not
-            // override, so dev and release would otherwise open the same file.
-            //
-            // Desktop only. On Android the data dir is the app's own
-            // per-package directory, so a debug and a release install of the
-            // same package can never coexist; asking for a sibling directory
-            // (…-dev) lands outside the app's sandbox, where creating it fails
-            // and the database cannot be opened at all.
-            let desktop_debug =
-                cfg!(debug_assertions) && !cfg!(any(target_os = "android", target_os = "ios"));
-            let data_dir = if desktop_debug {
-                data_dir.with_file_name("com.mytimeline.app-dev")
-            } else {
-                data_dir
-            };
             let conn = db::open(&data_dir.join("reader.db")).map_err(|e| e.to_string())?;
             app.manage(Arc::new(Mutex::new(conn)) as SharedConn);
             // One sync at a time, decided here rather than by the triggers.
@@ -385,7 +398,7 @@ pub fn run() {
             load_refresh_settings,
             save_refresh_settings
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 
@@ -484,4 +497,5 @@ mod tests {
             assert!(handler.contains(command), "{command} is not registered");
         }
     }
+
 }

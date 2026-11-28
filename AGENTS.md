@@ -67,30 +67,115 @@ node eval.mjs "$WS" "document.querySelector('.list-header').innerText"
 - The emulator has network access; a host-side `python -m http.server` is the
   deterministic source of a feed.
 
-### Desktop: `npm run dev`, driven by hand or by WebView2 DevTools
+### Desktop: `npm run dev`, driven by hand or by CDP
 
 ```bash
-npm run dev        # debug build, data dir com.mytimeline.app-dev (runs beside a release install)
+npm run dev        # debug build, own data dirs (runs beside a release install)
 ```
 
-The dev webview keeps WebView2's own DevTools (F12 / right-click → Inspect) for
-DOM inspection and hand-driving.
+The dev webview keeps WebView2's own DevTools (F12 / right-click → Inspect). It
+can also be driven over CDP like the Android build — point WebView2 at a port and
+read `webSocketDebuggerUrl` from `/json/list`:
 
-**CDP over a port does not work here.** Passing `--remote-debugging-port=9222`
-either through `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` or through the window
-config (`npx tauri dev --config '{"app":{"windows":[{"additionalBrowserArgs":"…"}]}}'`)
-makes webview creation fail outright:
-
-```
-Failed to setup app: runtime error: failed to create webview:
-WebView2 error: WindowsError(Error { code: HRESULT(0x8007139F), message:
-"The group or resource is not in the correct state to perform the requested operation." })
+```bash
+WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222 npm run dev
+curl -s http://127.0.0.1:9222/json/list   # -> webSocketDebuggerUrl, then eval.mjs above
 ```
 
-wry always supplies `additionalBrowserArgs`, and the port conflicts with
-WebView2's own transport, so the switch is not available to this app. For
-behavior, verify on Android (same frontend); on desktop verify layout and the
-wide-layout-only controls by reading the DOM in the DevTools console.
+This works while a release install is running, because debug desktop builds
+override their app directories (`$DATA/com.mytimeline.app-dev`,
+`$LOCALAPPDATA/com.mytimeline.app-dev`) in `src-tauri/src/lib.rs`.
+
+**`0x8007139F` (`ERROR_INVALID_STATE`) when creating the webview means two
+instances shared one WebView2 user data folder with different browser
+arguments.** WebView2 keys one browser process per user data folder and treats
+`AdditionalBrowserArguments` as global state for it, so a second environment
+whose arguments differ — adding `--remote-debugging-port` is enough — fails
+outright instead of opening a port. Before the directory override existed, dev
+and release both resolved the folder to `%LOCALAPPDATA%\com.mytimeline.app`
+(derived from the bundle identifier, which `tauri dev` does not change), so this
+happened whenever the production app was left running. If it reappears, the
+culprit is a live `msedgewebview2` browser process on the same folder, not the
+port itself: quit the other instance, or give this one a separate folder with
+`WEBVIEW2_USER_DATA_FOLDER`.
+
+Notes for this app:
+
+- `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` is *appended to* (and wins over) the
+  arguments wry sets via `additionalBrowserArgs`, so the environment variable is
+  the less invasive way to add the flag. The config route works too, but it
+  replaces wry's defaults — include
+  `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection` yourself.
+- `dataDirectory` in `app.windows[]` is ignored in tauri 2.12: the
+  `From<&WindowConfig> for WebviewAttributes` conversion never maps it. Use
+  `appDirectoriesOverride` (as this app does), `WEBVIEW2_USER_DATA_FOLDER`, or
+  `WebviewWindowBuilder::data_directory`.
+- Two webview instances with *identical* arguments (plain `npm run dev` next to a
+  release install) coexist fine; only differing arguments fail.
+
+### Picking the layer — all rows verified against WebView2 runtime 158.0.4370.45
+
+Each tool only proves its own layer: a green jsdom test says nothing about
+WebView2, and CDP says nothing about the native shell or a release build.
+
+| Tool | Proves | Cost | Platform |
+| --- | --- | --- | --- |
+| `cargo test` | db/fetch/sync logic on real SQLite (`db::open_memory`) | none | all |
+| `npm test` (jsdom + `vi.mock("@tauri-apps/api/core")`) | component logic and events | none | all |
+| `mockIPC` (`@tauri-apps/api/mocks`) | the real `invoke` → `__TAURI_INTERNALS__` path, argument serialization | none | all |
+| Vite + headless Edge + injected `__TAURI_INTERNALS__` | real Chromium layout, CSS, media queries, hit testing | Edge installed | all |
+| CDP (`--remote-debugging-port`) | real app, real backend, whole protocol | none | desktop, per app |
+| tauri-driver + msedgedriver | real app through W3C WebDriver (elements, clicks, `execute`) | driver version must equal the WebView2 runtime | Win/Linux |
+| adb + CDP / `uiautomator dump` | Android, real touch / native layer | emulator | Android |
+
+Default set: `cargo test`, `npm test`, and CDP on the real app. Add tauri-driver
+only when a WebDriver client or a platform matrix is wanted.
+
+- Use jsdom for components and CDP for behavior. Reach for a real browser only
+  when layout is what you are checking: jsdom performs no layout, so
+  `getBoundingClientRect()` and `matchMedia` results there are fiction.
+- Prefer `mockIPC` over `vi.mock("@tauri-apps/api/core")` when the command name
+  or the argument shape is what could be wrong — it goes through the real
+  serialization. Neither sees Rust-side serde, which only the two real-app rows do.
+- tauri-driver (installed as `~/.cargo/bin/tauri-driver.exe`; `msedgedriver.exe`
+  must match the WebView2 runtime version, from
+  `https://msedgedriver.microsoft.com/<version>/edgedriver_win64.zip`). It takes
+  `tauri:options.application`, then plain W3C calls work:
+
+  ```bash
+  tauri-driver --native-driver %TEMP%/wd/msedgedriver.exe --port 4444
+  # POST /session   {"capabilities":{"alwaysMatch":{"tauri:options":{"application":"…/target/debug/my-timeline.exe"}}}}
+  # POST /session/{id}/execute/sync  {"script":"return document.querySelector('.list-header').innerText","args":[]}
+  # POST /session/{id}/element      {"using":"css selector","value":".list-header"}  then GET …/text
+  # DELETE /session/{id}
+  ```
+
+  Build the target with `npx tauri build --debug --no-bundle` (it embeds the
+  frontend, so the driver can launch it without a dev server). Only webview
+  content is reachable — native menus and file dialogs are not. macOS has no
+  WebDriver path.
+- The web build in a real browser is the cheapest layout harness: run
+  `npm run dev:web`, launch
+  `msedge --headless=new --remote-debugging-port=9333 --user-data-dir=<temp>` on
+  `http://localhost:1420`, then inject a stub before the app boots:
+
+  ```js
+  // CDP: Page.addScriptToEvaluateOnNewDocument, then Page.reload
+  window.__TAURI_INTERNALS__ = {
+    invoke: (cmd, args) => Promise.resolve({ list_feeds: [], list_entries: [], … }[cmd] ?? null),
+    transformCallback: (cb) => cb,
+  };
+  ```
+
+- Do not build on `tauri::test` (`mock_builder`/`get_ipc_response`) yet. It needs
+  `tauri = { features = ["test"] }` in `[dev-dependencies]`, and every command
+  and helper taking `tauri::AppHandle` must become generic over `R: Runtime`
+  first (`AppHandle` defaults to `Wry`, whose `CommandArg` does not apply to
+  `MockRuntime`) — that part works. But even a bare
+  `mock_builder().build(mock_context(noop_assets()))` makes the test binary fail
+  to load with `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` on Windows, before any
+  test runs, and it survives `cargo clean -p my-timeline`. Unexplained; revisit
+  before trusting command-level tests.
 
 ### Builds
 

@@ -18,12 +18,13 @@ npm run build:app  # packaged Windows application
 
 ### Verifying UI behavior
 
-Do not verify by screenshot — it only proves a window rendered. The Android build
-can be driven at the DOM level over the DevTools protocol (emulator + `adb` +
-`Runtime.evaluate` / `Input.dispatchTouchEvent`), which exercises real gestures;
-the desktop build is driven by hand through WebView2's DevTools. `AGENTS.md` has
-the exact commands, including why `--remote-debugging-port` does not work for the
-desktop webview.
+Do not verify by screenshot — it only proves a window rendered. Both targets can
+be driven at the DOM level over the DevTools protocol: on Android with the
+emulator + `adb` + `Runtime.evaluate` / `Input.dispatchTouchEvent`, which also
+exercises real touch gestures; on desktop by starting the dev build with
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`. `AGENTS.md`
+has the exact commands, including the `0x8007139F` failure that means two
+instances are sharing one WebView2 user data folder.
 
 Desktop builds need only Node.js, npm, and a Rust toolchain.
 
