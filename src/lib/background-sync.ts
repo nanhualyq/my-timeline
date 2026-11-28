@@ -10,9 +10,19 @@ import type { SyncStatus } from "../api";
  * place. The throttle lives in the backend, so calling this often is free.
  */
 
-/** Whether a status means the library changed and the view must be refreshed. */
+/**
+ * Whether a status means the library changed and the view must be refreshed.
+ *
+ * The sync reports its local effect separately from what happened to the
+ * document on the server, because a download-only sync leaves the document
+ * alone while changing the library. A status recorded by a build that predates
+ * that field carries no local effect, so its outcome stands in: back then an
+ * applied change was what `synced` or `created` meant.
+ */
 export function appliedChanges(status: SyncStatus | null): boolean {
-  return status?.outcome === "synced" || status?.outcome === "created";
+  if (status === null) return false;
+  if (status.applied) return true;
+  return status.outcome === "synced" || status.outcome === "created";
 }
 
 /**

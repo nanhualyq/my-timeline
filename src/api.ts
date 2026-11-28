@@ -325,9 +325,13 @@ export type SyncOutcome = "synced" | "created" | "nothing_changed" | "failed";
 export interface SyncStatus {
   /** RFC3339, so the dialog can say when rather than only what. */
   ran_at: string;
+  /** What happened to the document on the server. */
   outcome: SyncOutcome;
   /** What was applied, or why the cycle failed — already a sentence. */
   detail: string;
+  /** Whether the sync changed the local library, so the view must refresh.
+   *  Statuses recorded by earlier builds omit it and read as "nothing". */
+  applied: boolean;
 }
 
 export interface SyncConnectionTest {

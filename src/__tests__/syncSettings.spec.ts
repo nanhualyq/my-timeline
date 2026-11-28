@@ -36,8 +36,9 @@ const SAVED: SyncConfig = {
 function status(
   outcome: SyncStatus["outcome"],
   detail: string,
+  applied = false,
 ): SyncStatus {
-  return { ran_at: "2026-11-28T10:00:00+00:00", outcome, detail };
+  return { ran_at: "2026-11-28T10:00:00+00:00", outcome, detail, applied };
 }
 
 type Handlers = Record<string, () => unknown>;
@@ -190,6 +191,37 @@ describe("WebDAV section", () => {
     expect(wrapper.get(".dialog-status").text()).toContain("2 feed(s) added");
     expect(wrapper.emitted("changed")).toBeTruthy();
     expect(wrapper.emitted("close")).toBeFalsy();
+  });
+
+  it("asks for a refresh when the sync only downloaded changes", async () => {
+    backendWith({
+      save_sync_config: () => null,
+      sync_now: () => status("nothing_changed", "1 feed(s) added", true),
+    });
+
+    const wrapper = mountDialog();
+    await flush();
+    await fillConnection(wrapper);
+    await wrapper.findAll(".sync-actions button")[2].trigger("click");
+    await flush();
+
+    expect(wrapper.get(".dialog-status").text()).toContain("1 feed(s) added");
+    expect(wrapper.emitted("changed")).toBeTruthy();
+  });
+
+  it("leaves the view alone when the sync applied nothing", async () => {
+    backendWith({
+      save_sync_config: () => null,
+      sync_now: () => status("nothing_changed", "no changes on either side"),
+    });
+
+    const wrapper = mountDialog();
+    await flush();
+    await fillConnection(wrapper);
+    await wrapper.findAll(".sync-actions button")[2].trigger("click");
+    await flush();
+
+    expect(wrapper.emitted("changed")).toBeFalsy();
   });
 
   it("keeps the reason a sync failed", async () => {

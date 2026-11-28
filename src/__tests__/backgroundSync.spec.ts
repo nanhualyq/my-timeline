@@ -21,8 +21,8 @@ const CONFIG: SyncConfig = {
   accept_invalid_certs: false,
 };
 
-function status(outcome: SyncStatus["outcome"], detail = "detail"): SyncStatus {
-  return { ran_at: new Date(0).toISOString(), outcome, detail };
+function status(outcome: SyncStatus["outcome"], detail = "detail", applied = false): SyncStatus {
+  return { ran_at: new Date(0).toISOString(), outcome, detail, applied };
 }
 
 beforeEach(() => {
@@ -31,6 +31,15 @@ beforeEach(() => {
 
 describe("what a status means for the view", () => {
   it("a sync that changed the library needs a refresh", () => {
+    expect(appliedChanges(status("synced", "detail", true))).toBe(true);
+    expect(appliedChanges(status("created", "detail", true))).toBe(true);
+  });
+
+  it("a download-only sync changed the library even though the document did not", () => {
+    expect(appliedChanges(status("nothing_changed", "1 feed(s) added", true))).toBe(true);
+  });
+
+  it("a status from a build without the field falls back to the outcome", () => {
     expect(appliedChanges(status("synced"))).toBe(true);
     expect(appliedChanges(status("created"))).toBe(true);
   });
@@ -38,6 +47,7 @@ describe("what a status means for the view", () => {
   it("a sync with nothing to do, a failure, and no sync at all do not", () => {
     expect(appliedChanges(status("nothing_changed"))).toBe(false);
     expect(appliedChanges(status("failed"))).toBe(false);
+    expect(appliedChanges(status("failed", "lost the race", true))).toBe(true);
     expect(appliedChanges(null)).toBe(false);
   });
 });
@@ -66,10 +76,15 @@ describe("background sync", () => {
   it("refreshes the view only when the sync applied something", async () => {
     harness.load.mockResolvedValue(CONFIG);
 
-    harness.syncNow.mockResolvedValue(status("synced"));
+    harness.syncNow.mockResolvedValue(status("synced", "detail", true));
     const reload = vi.fn();
     await runBackgroundSync(reload);
     expect(harness.syncNow).toHaveBeenCalledWith(false);
+    expect(reload).toHaveBeenCalledTimes(1);
+
+    reload.mockClear();
+    harness.syncNow.mockResolvedValue(status("nothing_changed", "1 feed(s) added", true));
+    await runBackgroundSync(reload);
     expect(reload).toHaveBeenCalledTimes(1);
 
     reload.mockClear();

@@ -42,7 +42,12 @@ async function mountApp(
     feeds?: number;
     view?: "all" | "unread";
     /** A saved WebDAV connection, as the settings dialog would have left it. */
-    sync?: { url?: string; outcome?: "synced" | "created" | "nothing_changed" | "failed" };
+    sync?: {
+      url?: string;
+      outcome?: "synced" | "created" | "nothing_changed" | "failed";
+      /** Whether that sync changed the library; defaults to "it did not". */
+      applied?: boolean;
+    };
   } = {},
 ): Promise<VueWrapper> {
   backend = new FakeBackend(options);
@@ -58,6 +63,7 @@ async function mountApp(
       ran_at: new Date(0).toISOString(),
       outcome: options.sync.outcome ?? "nothing_changed",
       detail: "1 feed(s) added",
+      applied: options.sync.applied ?? false,
     };
   }
   harness.backend = backend;
@@ -687,5 +693,51 @@ describe("background sync", () => {
     // Apps mounted by earlier tests are still listening on the same window, so
     // what matters is that focus causes another sync, not the exact count.
     expect(backend.countCalls("sync_now")).toBeGreaterThan(before);
+  });
+
+  it("shows a download-only sync's changes without a restart", async () => {
+    const wrapper = await mountApp({
+      entries: 120,
+      feeds: 1,
+      view: "all",
+      sync: { outcome: "nothing_changed", applied: true },
+    });
+    list(wrapper).vm.$emit("loadMore");
+    await flush();
+    expect(rows(wrapper)).toHaveLength(100);
+    const before = {
+      feeds: backend.countCalls("list_feeds"),
+      folders: backend.countCalls("list_folders"),
+      counts: backend.countCalls("entry_counts"),
+      rows: backend.countCalls("list_entries"),
+    };
+
+    // The document brought a subscription this installation had never fetched.
+    backend.feeds.push({
+      id: 2,
+      url: "https://f2.example/feed",
+      title: "From the other installation",
+      site_url: null,
+      last_fetched_at: null,
+      last_error: null,
+      folder_id: null,
+      unread_count: 0,
+    });
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+
+    const sidebar = wrapper.findComponent(Sidebar);
+    expect(
+      (sidebar.props("feeds") as { url: string }[]).map((f) => f.url),
+      "the sidebar lists the synced subscription without a restart",
+    ).toContain("https://f2.example/feed");
+    expect(backend.countCalls("list_feeds")).toBeGreaterThan(before.feeds);
+    expect(backend.countCalls("list_folders")).toBeGreaterThan(before.folders);
+    expect(backend.countCalls("entry_counts")).toBeGreaterThan(before.counts);
+    expect(backend.countCalls("list_entries")).toBeGreaterThan(before.rows);
+    expect(rows(wrapper), "the loaded window is kept").toHaveLength(100);
+    expect(list(wrapper).props("hasMore"), "the reader's place is kept").toBe(true);
+    expect(list(wrapper).props("view"), "the filter is kept").toBe("all");
+    expect(sidebar.props("selection"), "the selection is kept").toEqual({ kind: "all" });
   });
 });

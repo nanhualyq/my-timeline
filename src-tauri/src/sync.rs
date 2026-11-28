@@ -650,16 +650,37 @@ pub enum SyncOutcome {
 pub struct SyncStatus {
     /// RFC3339, so the dialog can say when rather than only what.
     pub ran_at: String,
+    /// What happened to the document on the server. Deliberately separate from
+    /// `applied`: a download-only sync leaves the document alone while changing
+    /// the local library, and a local-only upload is the reverse.
     pub outcome: SyncOutcome,
     pub detail: String,
+    /// Whether this sync changed the local library, so the view must refresh.
+    /// Absent from statuses recorded by earlier builds, which then read as
+    /// "nothing applied" and fall back to their `outcome`.
+    #[serde(default)]
+    pub applied: bool,
 }
 
 impl SyncStatus {
+    /// A status for a cycle that applied nothing locally: every path before the
+    /// merge, because nothing reached the library yet.
     fn now(outcome: SyncOutcome, detail: impl Into<String>) -> SyncStatus {
+        SyncStatus::with_applied(outcome, detail, false)
+    }
+
+    /// A status from a point where the merge has already run, so the caller
+    /// knows whether the library changed.
+    fn with_applied(
+        outcome: SyncOutcome,
+        detail: impl Into<String>,
+        applied: bool,
+    ) -> SyncStatus {
         SyncStatus {
             ran_at: chrono::Utc::now().to_rfc3339(),
             outcome,
             detail: detail.into(),
+            applied,
         }
     }
 }
@@ -839,6 +860,10 @@ async fn cycle(conn: &crate::reader::SharedConn, target: &webdav::Target) -> Syn
     };
 
     let mut attempt = 0;
+    // Carried across attempts: a rejected write re-reads and re-merges, and by
+    // then the first attempt's import reports no changes of its own, so the
+    // library change would otherwise be forgotten.
+    let mut applied = false;
     loop {
         attempt += 1;
         let fetched = match webdav::get_document(target, known_etag.as_deref()).await {
@@ -858,24 +883,25 @@ async fn cycle(conn: &crate::reader::SharedConn, target: &webdav::Target) -> Syn
         let (merged, summary) = {
             let guard = match conn.lock() {
                 Ok(guard) => guard,
-                Err(e) => return SyncStatus::now(SyncOutcome::Failed, e.to_string()),
+                Err(e) => return SyncStatus::with_applied(SyncOutcome::Failed, e.to_string(), applied),
             };
             let summary = match &remote {
                 Some(text) => match import(&guard, text) {
                     Ok(summary) => summary,
-                    Err(e) => return SyncStatus::now(SyncOutcome::Failed, e),
+                    Err(e) => return SyncStatus::with_applied(SyncOutcome::Failed, e, applied),
                 },
                 None => ImportSummary::default(),
             };
             let document = match project(&guard) {
                 Ok(document) => document,
-                Err(e) => return SyncStatus::now(SyncOutcome::Failed, e),
+                Err(e) => return SyncStatus::with_applied(SyncOutcome::Failed, e, applied),
             };
             match render(&document) {
                 Ok(rendered) => (rendered, summary),
-                Err(e) => return SyncStatus::now(SyncOutcome::Failed, e),
+                Err(e) => return SyncStatus::with_applied(SyncOutcome::Failed, e, applied),
             }
         };
+        applied |= !nothing_applied(&summary);
 
         // The server already holding this exact text is the same "nothing to
         // send" as having uploaded it a minute ago, so compare against both the
@@ -885,11 +911,14 @@ async fn cycle(conn: &crate::reader::SharedConn, target: &webdav::Target) -> Syn
 
         if unchanged {
             if let Err(e) = store_remote_state(conn, key, etag.as_deref(), &merged) {
-                return SyncStatus::now(SyncOutcome::Failed, e);
+                return SyncStatus::with_applied(SyncOutcome::Failed, e, applied);
             }
-            return SyncStatus::now(
+            // The document is untouched, but the library may not be: this is
+            // the download-only case, and the caller must still refresh.
+            return SyncStatus::with_applied(
                 SyncOutcome::NothingChanged,
                 detail_for(&summary, remote.is_some(), false),
+                applied,
             );
         }
 
@@ -902,29 +931,34 @@ async fn cycle(conn: &crate::reader::SharedConn, target: &webdav::Target) -> Syn
         match write {
             Ok(webdav::PutOutcome::Written { etag: new_etag }) => {
                 if let Err(e) = store_remote_state(conn, key, new_etag.as_deref(), &merged) {
-                    return SyncStatus::now(SyncOutcome::Failed, e);
+                    return SyncStatus::with_applied(SyncOutcome::Failed, e, applied);
                 }
                 let detail = detail_for(&summary, remote.is_some(), true);
                 return if creating {
-                    SyncStatus::now(SyncOutcome::Created, format!("created the document; {detail}"))
+                    SyncStatus::with_applied(
+                        SyncOutcome::Created,
+                        format!("created the document; {detail}"),
+                        applied,
+                    )
                 } else {
-                    SyncStatus::now(SyncOutcome::Synced, detail)
+                    SyncStatus::with_applied(SyncOutcome::Synced, detail, applied)
                 };
             }
             Ok(webdav::PutOutcome::PreconditionFailed) => {
                 if attempt >= SYNC_ATTEMPTS {
-                    return SyncStatus::now(
+                    return SyncStatus::with_applied(
                         SyncOutcome::Failed,
                         format!(
                             "the document kept changing on the server; gave up after {SYNC_ATTEMPTS} attempts"
                         ),
+                        applied,
                     );
                 }
                 // Re-read from the version just read, so the next read returns
                 // the body rather than another 304.
                 known_etag = etag;
             }
-            Err(e) => return SyncStatus::now(SyncOutcome::Failed, e),
+            Err(e) => return SyncStatus::with_applied(SyncOutcome::Failed, e, applied),
         }
     }
 }
@@ -1729,6 +1763,167 @@ mod tests {
         assert_eq!(stub.put_count(), puts, "nothing needed sending");
     }
 
+    /// The shape that used to go unreported: the document on the server already
+    /// holds the merged state, so nothing is uploaded, while the library did
+    /// change. The outcome alone would say "nothing happened".
+    #[tokio::test]
+    async fn a_download_only_sync_reports_the_library_change() {
+        let stub = Stub::start();
+        let conn = shared(db::open_memory().unwrap());
+        let url = "https://a.example/feed";
+
+        // The other installation knows this entry and has starred it.
+        let other = db::open_memory().unwrap();
+        let other_feed = db::insert_or_update_feed(&other, url, "A", None).unwrap();
+        db::upsert_entry(
+            &other,
+            other_feed,
+            "g1",
+            "Headline",
+            None,
+            "<p>x</p>",
+            "x",
+            None,
+            Some(&stamp_days_ago(0)),
+        )
+        .unwrap();
+        db::set_starred(&other, entry_id(&other, "g1"), true).unwrap();
+        stub.set_body(&export(&other).unwrap().text);
+        configure(&conn, &stub);
+
+        // This installation has the entry, but not the star.
+        {
+            let guard = conn.lock().unwrap();
+            let feed = db::insert_or_update_feed(&guard, url, "A", None).unwrap();
+            db::upsert_entry(
+                &guard,
+                feed,
+                "g1",
+                "Headline",
+                None,
+                "<p>x</p>",
+                "x",
+                None,
+                Some(&stamp_days_ago(0)),
+            )
+            .unwrap();
+        }
+
+        let engine = Arc::new(SyncEngine::new());
+        let status = engine.sync(&conn, true).await.unwrap();
+
+        assert_eq!(
+            status.outcome,
+            SyncOutcome::NothingChanged,
+            "the document on the server was already the merged state"
+        );
+        assert!(status.applied, "the library changed, so the view must refresh");
+        assert!(status.detail.contains("1 star(s)"), "{}", status.detail);
+        assert_eq!(stub.put_count(), 0, "nothing needed sending");
+        assert_eq!(stub.requests().len(), 1, "one read, no write");
+
+        let guard = conn.lock().unwrap();
+        let starred: i64 = guard
+            .query_row(
+                "SELECT is_starred FROM entries WHERE id = ?1",
+                params![entry_id(&guard, "g1")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(starred, 1, "the star landed in the library");
+    }
+
+    /// A rejected write re-reads and re-merges, and the second import reports no
+    /// changes of its own. The library change from the first attempt must not be
+    /// forgotten.
+    #[tokio::test]
+    async fn a_conflict_retry_still_reports_the_library_change() {
+        let stub = Stub::start();
+        stub.set_body(&document_from(&["https://b.example/feed"]));
+        stub.always_conflict();
+        let conn = shared(db::open_memory().unwrap());
+        // A local subscription the server has never seen forces a write attempt
+        // on every attempt, so the rejections keep coming.
+        {
+            let guard = conn.lock().unwrap();
+            db::insert_or_update_feed(&guard, "https://c.example/feed", "C", None).unwrap();
+        }
+        configure(&conn, &stub);
+
+        let engine = Arc::new(SyncEngine::new());
+        let status = engine.sync(&conn, true).await.unwrap();
+
+        assert_eq!(status.outcome, SyncOutcome::Failed);
+        assert!(status.detail.contains("gave up"), "{}", status.detail);
+        assert!(
+            status.applied,
+            "the first attempt had already merged the remote subscription in"
+        );
+        assert!(local_urls(&conn).contains(&"https://b.example/feed".to_string()));
+    }
+
+    /// Uploading is not applying: the library already held what was sent, so
+    /// there is nothing to refresh.
+    #[tokio::test]
+    async fn uploading_local_changes_reports_no_library_change() {
+        let stub = Stub::start();
+        let conn = shared(seeded_library());
+        configure(&conn, &stub);
+        let engine = Arc::new(SyncEngine::new());
+
+        let created = engine.sync(&conn, true).await.unwrap();
+        assert_eq!(created.outcome, SyncOutcome::Created);
+        assert!(!created.applied, "creating the document applied nothing locally");
+
+        {
+            let guard = conn.lock().unwrap();
+            db::insert_or_update_feed(&guard, "https://d.example/feed", "D", None).unwrap();
+        }
+        let synced = engine.sync(&conn, true).await.unwrap();
+
+        assert_eq!(synced.outcome, SyncOutcome::Synced);
+        assert!(!synced.applied, "the library already held the uploaded change");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_status_keeps_the_recorded_library_change() {
+        let stub = Stub::start();
+        stub.set_body(&document_from(&["https://b.example/feed"]));
+        let conn = shared(db::open_memory().unwrap());
+        configure(&conn, &stub);
+        let engine = Arc::new(SyncEngine::new());
+
+        let first = engine.sync(&conn, true).await.unwrap();
+        assert!(first.applied);
+
+        let throttled = engine.sync(&conn, false).await.unwrap();
+        assert_eq!(throttled.ran_at, first.ran_at, "the throttle replayed the status");
+        assert!(throttled.applied, "a replay keeps the recorded fact");
+
+        // A trigger that arrives during a cycle reports that cycle's status.
+        engine.running.store(true, Ordering::Release);
+        let dropped = engine.sync(&conn, true).await.unwrap();
+        engine.running.store(false, Ordering::Release);
+        assert_eq!(dropped.ran_at, first.ran_at);
+        assert!(dropped.applied);
+    }
+
+    #[test]
+    fn a_status_recorded_before_the_field_existed_reads_as_unapplied() {
+        let old = r#"{"ran_at":"2026-11-28T10:00:00+00:00","outcome":"synced","detail":"uploaded local changes"}"#;
+        let parsed: SyncStatus = serde_json::from_str(old).unwrap();
+        assert!(!parsed.applied, "an older status makes no claim about the library");
+
+        let fresh = SyncStatus::with_applied(
+            SyncOutcome::NothingChanged,
+            "1 feed(s) added",
+            true,
+        );
+        let text = serde_json::to_string(&fresh).unwrap();
+        assert!(text.contains("\"applied\":true"), "{text}");
+        assert!(serde_json::from_str::<SyncStatus>(&text).unwrap().applied);
+    }
+
     #[tokio::test]
     async fn a_write_that_loses_the_race_is_re_read_and_merged() {
         let stub = Stub::start();
@@ -1947,6 +2142,7 @@ mod tests {
         let status = engine.sync(&conn, true).await.unwrap();
 
         assert_eq!(status.outcome, SyncOutcome::Failed);
+        assert!(!status.applied, "nothing reached the library");
         assert!(
             status.detail.contains("cannot reach"),
             "the reason names the cause: {}",

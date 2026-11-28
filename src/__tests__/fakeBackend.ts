@@ -55,6 +55,7 @@ export class FakeBackend {
     ran_at: new Date(0).toISOString(),
     outcome: "nothing_changed",
     detail: "no changes on either side",
+    applied: false,
   };
 
   private gates: { cmd: string; promise: Promise<void> }[] = [];

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { appliedChanges } from "../lib/background-sync";
 import {
   addFeed,
   createFolder,
@@ -263,7 +264,9 @@ async function runSync() {
   try {
     await saveSyncConfig({ ...config.value });
     lastStatus.value = await syncNow(true);
-    if (lastStatus.value.outcome === "synced" || lastStatus.value.outcome === "created") {
+    // The document on the server may have needed nothing while the library
+    // changed; only the sync itself can tell, so ask it rather than guess.
+    if (appliedChanges(lastStatus.value)) {
       emit("changed");
     }
   } catch (e) {
